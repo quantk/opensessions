@@ -113,6 +113,33 @@ func TestScanAssemblesSessionsAndClassifiesParts(t *testing.T) {
 	}
 }
 
+func TestScanParsesFileBackedSubagentMetadata(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "project", "proj-child.json"), `{"id":"proj-child","worktree":"/tmp/subagent-project","time":{"created":1777800000000,"updated":1777800000000}}`)
+	mustWriteFile(t, filepath.Join(root, "session", "proj-child", "ses_parent.json"), `{"id":"ses_parent","projectID":"proj-child","directory":"/tmp/subagent-project","title":"Parent session","time":{"created":1777800000000,"updated":1777800100000}}`)
+	mustWriteFile(t, filepath.Join(root, "session", "proj-child", "ses_child.json"), `{"id":"ses_child","projectID":"proj-child","parentID":"ses_parent","directory":"/tmp/subagent-project","title":"Child session","time":{"created":1777800005000,"updated":1777800006000}}`)
+	mustWriteFile(t, filepath.Join(root, "message", "ses_parent", "msg_parent.json"), `{"id":"msg_parent","sessionID":"ses_parent","role":"assistant","time":{"created":1777800001000}}`)
+	mustWriteFile(t, filepath.Join(root, "message", "ses_child", "msg_child.json"), `{"id":"msg_child","sessionID":"ses_child","role":"assistant","time":{"created":1777800005000}}`)
+	mustWriteFile(t, filepath.Join(root, "part", "msg_parent", "prt_task.json"), `{"id":"prt_task","sessionID":"ses_parent","messageID":"msg_parent","type":"tool","tool":"task","state":{"status":"completed","title":"Run subagent","input":{"subagent_type":"explore"},"metadata":{"sessionId":"ses_child"}},"time":{"start":1777800002000,"end":1777800003000}}`)
+	mustWriteFile(t, filepath.Join(root, "part", "msg_child", "prt_child_text.json"), `{"id":"prt_child_text","sessionID":"ses_child","messageID":"msg_child","type":"text","text":"child transcript","time":{"start":1777800005000}}`)
+
+	snapshot, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	child := findSession(t, snapshot, "ses_child")
+	if child.ParentID != "ses_parent" {
+		t.Fatalf("child parent id = %q, want ses_parent", child.ParentID)
+	}
+	task := findPart(t, findSession(t, snapshot, "ses_parent"), "prt_task")
+	if task.LinkedSessionID != "ses_child" {
+		t.Fatalf("linked session id = %q, want ses_child", task.LinkedSessionID)
+	}
+	if task.SubagentName != "explore" {
+		t.Fatalf("subagent name = %q, want explore", task.SubagentName)
+	}
+}
+
 func TestScanIncludesSQLiteDatabaseSessions(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "opencode", "storage")
@@ -155,6 +182,36 @@ func TestScanIncludesSQLiteDatabaseSessions(t *testing.T) {
 	}
 }
 
+func TestScanIncludesSQLiteDatabaseChildSessions(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "opencode", "storage")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir storage root: %v", err)
+	}
+	dbPath := filepath.Join(base, "opencode", "opencode.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite fixture: %v", err)
+	}
+	defer db.Close()
+	mustExec(t, db, `CREATE TABLE project (id text PRIMARY KEY, worktree text NOT NULL, vcs text, time_created integer NOT NULL, time_updated integer NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE session (id text PRIMARY KEY, project_id text NOT NULL, parent_id text, slug text NOT NULL, directory text NOT NULL, title text NOT NULL, version text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`)
+	mustExec(t, db, `INSERT INTO project (id, worktree, vcs, time_created, time_updated) VALUES ('proj-db', '/tmp/db-project', 'git', 1777800000000, 1777800000000)`)
+	mustExec(t, db, `INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated) VALUES ('ses_db_parent', 'proj-db', NULL, 'parent', '/tmp/db-project', 'Database parent', '1.2.3', 1777800000000, 1777800100000)`)
+	mustExec(t, db, `INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated) VALUES ('ses_db_child', 'proj-db', 'ses_db_parent', 'child', '/tmp/db-project', 'Database child', '1.2.3', 1777800001000, 1777800002000)`)
+
+	snapshot, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	child := findSession(t, snapshot, "ses_db_child")
+	if child.ParentID != "ses_db_parent" {
+		t.Fatalf("database child parent id = %q, want ses_db_parent", child.ParentID)
+	}
+}
+
 func TestScanDoesNotModifyStorage(t *testing.T) {
 	root := fixtureRoot(t)
 	path := filepath.Join(root, "part", "msg_assistant", "prt_tool.json")
@@ -180,6 +237,16 @@ func mustExec(t *testing.T, db *sql.DB, query string) {
 	t.Helper()
 	if _, err := db.Exec(query); err != nil {
 		t.Fatalf("exec %q: %v", query, err)
+	}
+}
+
+func mustWriteFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
 	}
 }
 

@@ -85,7 +85,13 @@ func scanDatabaseProjects(ctx context.Context, db *sql.DB, dbPath string, info f
 }
 
 func scanDatabaseSessions(ctx context.Context, db *sql.DB, dbPath string, info fs.FileInfo) ([]Session, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, project_id, directory, title, slug, version, time_created, time_updated FROM session`)
+	query := `SELECT id, project_id, directory, title, slug, version, time_created, time_updated, '' FROM session`
+	if ok, err := databaseColumnExists(ctx, db, "session", "parent_id"); err != nil {
+		return nil, err
+	} else if ok {
+		query = `SELECT id, project_id, directory, title, slug, version, time_created, time_updated, coalesce(parent_id, '') FROM session`
+	}
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("scan database sessions: %w", err)
 	}
@@ -95,7 +101,7 @@ func scanDatabaseSessions(ctx context.Context, db *sql.DB, dbPath string, info f
 	for rows.Next() {
 		var session Session
 		var created, updated int64
-		if err := rows.Scan(&session.ID, &session.ProjectID, &session.Directory, &session.Title, &session.Slug, &session.Version, &created, &updated); err != nil {
+		if err := rows.Scan(&session.ID, &session.ProjectID, &session.Directory, &session.Title, &session.Slug, &session.Version, &created, &updated, &session.ParentID); err != nil {
 			return nil, fmt.Errorf("scan database session row: %w", err)
 		}
 		session.ProjectPath = session.Directory
@@ -105,6 +111,31 @@ func scanDatabaseSessions(ctx context.Context, db *sql.DB, dbPath string, info f
 		sessions = append(sessions, session)
 	}
 	return sessions, rows.Err()
+}
+
+func databaseColumnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, fmt.Errorf("inspect database table %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, fmt.Errorf("inspect database table %s: %w", table, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("inspect database table %s: %w", table, err)
+	}
+	return false, nil
 }
 
 func scanDatabaseMessages(ctx context.Context, db *sql.DB, dbPath string, info fs.FileInfo) ([]Message, error) {

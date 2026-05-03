@@ -23,6 +23,7 @@ type Store struct {
 type SessionSummary struct {
 	ID             string
 	ProjectID      string
+	ParentID       string
 	ProjectPath    string
 	Directory      string
 	Title          string
@@ -39,26 +40,28 @@ type SessionSummary struct {
 }
 
 type TimelinePart struct {
-	PartID     string
-	SessionID  string
-	MessageID  string
-	Role       string
-	Type       string
-	Kind       opencode.PartKind
-	ToolName   string
-	Status     string
-	Title      string
-	FilePath   string
-	Preview    string
-	IndexText  string
-	RawJSON    string
-	SourcePath string
-	SizeBytes  int64
-	Heavy      bool
-	Binary     bool
-	SkippedRaw bool
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	PartID          string
+	SessionID       string
+	MessageID       string
+	Role            string
+	Type            string
+	Kind            opencode.PartKind
+	ToolName        string
+	Status          string
+	Title           string
+	SubagentName    string
+	LinkedSessionID string
+	FilePath        string
+	Preview         string
+	IndexText       string
+	RawJSON         string
+	SourcePath      string
+	SizeBytes       int64
+	Heavy           bool
+	Binary          bool
+	SkippedRaw      bool
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type RawPart struct {
@@ -164,10 +167,11 @@ ON CONFLICT(id) DO UPDATE SET
 
 	for _, session := range snapshot.Sessions {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO sessions (id, project_id, project_path, directory, title, slug, version, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write, source_path)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO sessions (id, project_id, parent_id, project_path, directory, title, slug, version, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write, source_path)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   project_id = excluded.project_id,
+  parent_id = excluded.parent_id,
   project_path = excluded.project_path,
   directory = excluded.directory,
   title = excluded.title,
@@ -187,7 +191,7 @@ ON CONFLICT(id) DO UPDATE SET
   token_reasoning = excluded.token_reasoning,
   token_cache_read = excluded.token_cache_read,
   token_cache_write = excluded.token_cache_write,
-  source_path = excluded.source_path`, session.ID, session.ProjectID, session.ProjectPath, session.Directory, session.Title, session.Slug, session.Version, session.ModelProvider, session.ModelID, millis(session.CreatedAt), millis(session.UpdatedAt), session.MessageCount, session.PartCount, session.HeavyPartCount, boolInt(session.TokenUsage.Available), session.TokenUsage.Total, session.TokenUsage.Input, session.TokenUsage.Output, session.TokenUsage.Reasoning, session.TokenUsage.CacheRead, session.TokenUsage.CacheWrite, session.Source.Path); err != nil {
+  source_path = excluded.source_path`, session.ID, session.ProjectID, session.ParentID, session.ProjectPath, session.Directory, session.Title, session.Slug, session.Version, session.ModelProvider, session.ModelID, millis(session.CreatedAt), millis(session.UpdatedAt), session.MessageCount, session.PartCount, session.HeavyPartCount, boolInt(session.TokenUsage.Available), session.TokenUsage.Total, session.TokenUsage.Input, session.TokenUsage.Output, session.TokenUsage.Reasoning, session.TokenUsage.CacheRead, session.TokenUsage.CacheWrite, session.Source.Path); err != nil {
 			return fmt.Errorf("upsert session %s: %w", session.ID, err)
 		}
 		if err := upsertScanMetadataTx(ctx, tx, session.Source.Path, session.Source.SizeBytes, session.Source.ModTime); err != nil {
@@ -216,8 +220,8 @@ ON CONFLICT(id) DO UPDATE SET
 
 			for _, part := range message.Parts {
 				if _, err := tx.ExecContext(ctx, `
-INSERT INTO parts (id, session_id, message_id, type, kind, tool_name, status, title, file_path, mime, filename, preview, index_text, raw_json, source_path, size_bytes, heavy, binary, skipped_raw, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO parts (id, session_id, message_id, type, kind, tool_name, status, title, subagent_name, linked_session_id, file_path, mime, filename, preview, index_text, raw_json, source_path, size_bytes, heavy, binary, skipped_raw, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   session_id = excluded.session_id,
   message_id = excluded.message_id,
@@ -226,6 +230,8 @@ ON CONFLICT(id) DO UPDATE SET
   tool_name = excluded.tool_name,
   status = excluded.status,
   title = excluded.title,
+  subagent_name = excluded.subagent_name,
+  linked_session_id = excluded.linked_session_id,
   file_path = excluded.file_path,
   mime = excluded.mime,
   filename = excluded.filename,
@@ -238,7 +244,7 @@ ON CONFLICT(id) DO UPDATE SET
   binary = excluded.binary,
   skipped_raw = excluded.skipped_raw,
 				  created_at = excluded.created_at,
-				  updated_at = excluded.updated_at`, part.ID, part.SessionID, part.MessageID, part.Type, string(part.Kind), part.ToolName, part.Status, part.Title, part.FilePath, part.MIME, part.Filename, part.Preview, part.IndexText, part.RawJSON, part.Source.Path, part.SizeBytes, boolInt(part.Heavy), boolInt(part.Binary), boolInt(part.SkippedRaw), millis(part.CreatedAt), millis(part.UpdatedAt)); err != nil {
+				  updated_at = excluded.updated_at`, part.ID, part.SessionID, part.MessageID, part.Type, string(part.Kind), part.ToolName, part.Status, part.Title, part.SubagentName, part.LinkedSessionID, part.FilePath, part.MIME, part.Filename, part.Preview, part.IndexText, part.RawJSON, part.Source.Path, part.SizeBytes, boolInt(part.Heavy), boolInt(part.Binary), boolInt(part.SkippedRaw), millis(part.CreatedAt), millis(part.UpdatedAt)); err != nil {
 					return fmt.Errorf("upsert part %s: %w", part.ID, err)
 				}
 				if err := upsertScanMetadataTx(ctx, tx, part.Source.Path, part.Source.SizeBytes, part.Source.ModTime); err != nil {
@@ -260,7 +266,18 @@ ON CONFLICT(session_id, part_id, scope) DO UPDATE SET content = excluded.content
 }
 
 func (s *Store) ListSessions(ctx context.Context) ([]SessionSummary, error) {
-	return s.querySessions(ctx, `SELECT id, project_id, project_path, directory, title, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write FROM sessions ORDER BY updated_at DESC, id`, nil)
+	return s.querySessions(ctx, `SELECT id, project_id, coalesce(parent_id, ''), project_path, directory, title, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write FROM sessions WHERE coalesce(parent_id, '') = '' ORDER BY updated_at DESC, id`, nil)
+}
+
+func (s *Store) Session(ctx context.Context, sessionID string) (SessionSummary, error) {
+	sessions, err := s.querySessions(ctx, `SELECT id, project_id, coalesce(parent_id, ''), project_path, directory, title, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write FROM sessions WHERE id = ?`, []any{sessionID})
+	if err != nil {
+		return SessionSummary{}, err
+	}
+	if len(sessions) == 0 {
+		return SessionSummary{}, sql.ErrNoRows
+	}
+	return sessions[0], nil
 }
 
 func (s *Store) SearchSessions(ctx context.Context, query string) ([]SessionSummary, error) {
@@ -270,23 +287,24 @@ func (s *Store) SearchSessions(ctx context.Context, query string) ([]SessionSumm
 	}
 	like := "%" + strings.ToLower(query) + "%"
 	return s.querySessions(ctx, `
-SELECT DISTINCT s.id, s.project_id, s.project_path, s.directory, s.title, s.model_provider, s.model_id, s.created_at, s.updated_at, s.message_count, s.part_count, s.heavy_part_count, s.token_usage_available, s.token_total, s.token_input, s.token_output, s.token_reasoning, s.token_cache_read, s.token_cache_write
+SELECT DISTINCT s.id, s.project_id, coalesce(s.parent_id, ''), s.project_path, s.directory, s.title, s.model_provider, s.model_id, s.created_at, s.updated_at, s.message_count, s.part_count, s.heavy_part_count, s.token_usage_available, s.token_total, s.token_input, s.token_output, s.token_reasoning, s.token_cache_read, s.token_cache_write
 FROM sessions s
 LEFT JOIN searchable_documents d ON d.session_id = s.id
 LEFT JOIN tags t ON t.session_id = s.id
-WHERE lower(coalesce(s.title, '')) LIKE ?
+WHERE coalesce(s.parent_id, '') = ''
+  AND (lower(coalesce(s.title, '')) LIKE ?
    OR lower(coalesce(s.project_path, '')) LIKE ?
    OR lower(coalesce(s.directory, '')) LIKE ?
    OR lower(coalesce(s.model_provider, '')) LIKE ?
    OR lower(coalesce(s.model_id, '')) LIKE ?
    OR lower(coalesce(d.content, '')) LIKE ?
-   OR lower(coalesce(t.tag, '')) LIKE ?
+   OR lower(coalesce(t.tag, '')) LIKE ?)
 ORDER BY s.updated_at DESC, s.id`, []any{like, like, like, like, like, like, like})
 }
 
 func (s *Store) SessionTimeline(ctx context.Context, sessionID string) ([]TimelinePart, error) {
 	return s.queryTimeline(ctx, `
-SELECT p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
+SELECT p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
 FROM parts p
 JOIN messages m ON m.id = p.message_id
 WHERE p.session_id = ?
@@ -300,7 +318,7 @@ func (s *Store) SearchSession(ctx context.Context, sessionID, query string) ([]T
 	}
 	like := "%" + strings.ToLower(query) + "%"
 	return s.queryTimeline(ctx, `
-SELECT DISTINCT p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
+SELECT DISTINCT p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
 FROM parts p
 JOIN messages m ON m.id = p.message_id
 LEFT JOIN searchable_documents d ON d.part_id = p.id
@@ -408,7 +426,7 @@ func (s *Store) querySessions(ctx context.Context, query string, args []any) ([]
 		var session SessionSummary
 		var created, updated int64
 		var tokenUsageAvailable int
-		if err := rows.Scan(&session.ID, &session.ProjectID, &session.ProjectPath, &session.Directory, &session.Title, &session.ModelProvider, &session.ModelID, &created, &updated, &session.MessageCount, &session.PartCount, &session.HeavyPartCount, &tokenUsageAvailable, &session.TokenUsage.Total, &session.TokenUsage.Input, &session.TokenUsage.Output, &session.TokenUsage.Reasoning, &session.TokenUsage.CacheRead, &session.TokenUsage.CacheWrite); err != nil {
+		if err := rows.Scan(&session.ID, &session.ProjectID, &session.ParentID, &session.ProjectPath, &session.Directory, &session.Title, &session.ModelProvider, &session.ModelID, &created, &updated, &session.MessageCount, &session.PartCount, &session.HeavyPartCount, &tokenUsageAvailable, &session.TokenUsage.Total, &session.TokenUsage.Input, &session.TokenUsage.Output, &session.TokenUsage.Reasoning, &session.TokenUsage.CacheRead, &session.TokenUsage.CacheWrite); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -452,7 +470,7 @@ func (s *Store) queryTimeline(ctx context.Context, query string, args ...any) ([
 		var kind string
 		var heavy, binary, skipped int
 		var created, updated int64
-		if err := rows.Scan(&part.PartID, &part.SessionID, &part.MessageID, &part.Role, &part.Type, &kind, &part.ToolName, &part.Status, &part.Title, &part.FilePath, &part.Preview, &part.IndexText, &part.RawJSON, &part.SourcePath, &part.SizeBytes, &heavy, &binary, &skipped, &created, &updated); err != nil {
+		if err := rows.Scan(&part.PartID, &part.SessionID, &part.MessageID, &part.Role, &part.Type, &kind, &part.ToolName, &part.Status, &part.Title, &part.SubagentName, &part.LinkedSessionID, &part.FilePath, &part.Preview, &part.IndexText, &part.RawJSON, &part.SourcePath, &part.SizeBytes, &heavy, &binary, &skipped, &created, &updated); err != nil {
 			return nil, err
 		}
 		part.Kind = opencode.PartKind(kind)

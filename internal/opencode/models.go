@@ -33,6 +33,7 @@ type Project struct {
 type Session struct {
 	ID             string
 	ProjectID      string
+	ParentID       string
 	ProjectPath    string
 	Directory      string
 	Title          string
@@ -76,27 +77,29 @@ type TokenUsage struct {
 }
 
 type Part struct {
-	ID         string
-	SessionID  string
-	MessageID  string
-	Type       string
-	Kind       PartKind
-	ToolName   string
-	Status     string
-	Title      string
-	FilePath   string
-	MIME       string
-	Filename   string
-	Preview    string
-	IndexText  string
-	RawJSON    string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-	SizeBytes  int64
-	Heavy      bool
-	Binary     bool
-	SkippedRaw bool
-	Source     FileRecord
+	ID              string
+	SessionID       string
+	MessageID       string
+	Type            string
+	Kind            PartKind
+	ToolName        string
+	Status          string
+	Title           string
+	SubagentName    string
+	LinkedSessionID string
+	FilePath        string
+	MIME            string
+	Filename        string
+	Preview         string
+	IndexText       string
+	RawJSON         string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	SizeBytes       int64
+	Heavy           bool
+	Binary          bool
+	SkippedRaw      bool
+	Source          FileRecord
 }
 
 type SessionDiff struct {

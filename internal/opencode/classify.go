@@ -101,9 +101,29 @@ func classifyToolPart(part *Part, data map[string]any) {
 	state := mapValue(data, "state")
 	part.Status = stringValue(state, "status")
 	part.Title = firstNonEmpty(stringValue(state, "title"), stringValue(state, "description"))
-
-	fields := []string{"tool", part.ToolName, part.Status, part.Title}
 	input := mapValue(state, "input")
+	metadata := mapValue(state, "metadata")
+	part.SubagentName = firstNonEmpty(
+		stringValue(input, "subagent_type"),
+		stringValue(input, "subagentType"),
+		stringValue(input, "subagent"),
+		stringValue(input, "subagentName"),
+		stringValue(input, "agent_type"),
+		stringValue(input, "agentType"),
+		stringValue(input, "agent"),
+		stringValue(input, "agentName"),
+		stringValue(metadata, "subagent_type"),
+		stringValue(metadata, "subagentType"),
+		stringValue(metadata, "subagent"),
+		stringValue(metadata, "subagentName"),
+		stringValue(metadata, "agent_type"),
+		stringValue(metadata, "agentType"),
+		stringValue(metadata, "agent"),
+		stringValue(metadata, "agentName"),
+	)
+	part.LinkedSessionID = stringValue(metadata, "sessionId")
+
+	fields := []string{"tool", part.ToolName, part.Status, part.Title, part.SubagentName}
 	for _, key := range []string{"command", "description", "workdir", "path", "file", "pattern"} {
 		fields = append(fields, stringValue(input, key))
 	}

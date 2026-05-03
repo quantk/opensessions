@@ -170,6 +170,24 @@ func TestGroupedSessionNavigationSkipsHeadersAndKeepsSelectionVisible(t *testing
 	requireSelectedSessionVisible(t, model)
 }
 
+func TestModelFiltersChildSessionsFromFlatAndGroupedLists(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions = append(repo.sessions, index.SessionSummary{ID: "ses_child", ParentID: "ses_project", ProjectID: "proj", ProjectPath: "/tmp/project", Title: "Child session"})
+	model := NewModel(repo, repo.sessions)
+
+	if containsSessionID(model.sessions, "ses_child") || strings.Contains(plainView(model.View()), "Child session") {
+		t.Fatalf("flat session list should hide child sessions:\n%s", model.View())
+	}
+	model = sendKey(t, model, "v")
+	if containsSessionID(model.sessions, "ses_child") || strings.Contains(plainView(model.View()), "Child session") {
+		t.Fatalf("grouped session list should hide child sessions:\n%s", model.View())
+	}
+	model = search(t, model, "child")
+	if containsSessionID(model.sessions, "ses_child") || strings.Contains(plainView(model.View()), "Child session") {
+		t.Fatalf("session search should hide child sessions:\n%s", model.View())
+	}
+}
+
 func TestModelRendersSessionTokenUsage(t *testing.T) {
 	repo := newFakeRepo(t)
 	model := NewModel(repo, repo.sessions)
@@ -348,6 +366,107 @@ func TestTimelineOpensFocusedToolDetails(t *testing.T) {
 	}
 	if !strings.Contains(view, "Command") || !strings.Contains(view, "go test ./...") || !strings.Contains(view, "Workdir: /tmp/fixture") {
 		t.Fatalf("tool detail missing structured fields:\n%s", view)
+	}
+}
+
+func TestLinkedTaskOpensChildTimelineAndBackRestoresParent(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions = append(repo.sessions, index.SessionSummary{ID: "ses_child", ParentID: "ses_project", ProjectID: "proj", ProjectPath: "/tmp/project", Title: "Child subagent"})
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_text", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Preview: "run a subagent", IndexText: "run a subagent"},
+		{PartID: "prt_task", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "task", Status: "completed", Title: "Research dependency", SubagentName: "explore", Preview: "subagent finished", LinkedSessionID: "ses_child"},
+	}
+	repo.timelines["ses_child"] = []index.TimelinePart{
+		{PartID: "prt_child", SessionID: "ses_child", MessageID: "msg_child", Role: "assistant", Kind: opencode.PartKindText, Preview: "child transcript", IndexText: "child transcript"},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	model = sendKey(t, model, "j")
+	if !strings.Contains(plainView(model.View()), "> [subagent:explore] Research dependency") {
+		t.Fatalf("linked task row missing subagent affordance:\n%s", model.View())
+	}
+	model = sendKey(t, model, "enter")
+	view := plainView(model.View())
+	if model.mode != ViewTimeline || model.currentSession.ID != "ses_child" || !strings.Contains(view, "child transcript") {
+		t.Fatalf("linked task did not open child timeline: mode=%v current=%q\n%s", model.mode, model.currentSession.ID, model.View())
+	}
+	if !strings.Contains(view, "Nested under: Project session via Research dependency") {
+		t.Fatalf("child timeline missing nested context:\n%s", model.View())
+	}
+
+	model = sendKey(t, model, "h")
+	if model.mode != ViewTimeline || model.currentSession.ID != "ses_project" || model.selectedPart != 1 {
+		t.Fatalf("back did not restore parent task context: mode=%v current=%q selected=%d", model.mode, model.currentSession.ID, model.selectedPart)
+	}
+	if !strings.Contains(plainView(model.View()), "Research dependency") {
+		t.Fatalf("restored parent task row not visible:\n%s", model.View())
+	}
+}
+
+func TestUnlinkedTaskAndOrdinaryToolStillOpenDetails(t *testing.T) {
+	repo := newFakeRepo(t)
+	taskRaw := `{"type":"tool","tool":"task","state":{"status":"completed","title":"No child"}}`
+	toolRaw := `{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"go test ./internal/tui"}}}`
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_text", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Preview: "run tools", IndexText: "run tools"},
+		{PartID: "prt_task_unlinked", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "task", Status: "completed", Title: "No child", RawJSON: taskRaw, SizeBytes: int64(len(taskRaw))},
+		{PartID: "prt_bash", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "bash", Status: "completed", Preview: "go test", RawJSON: toolRaw, SizeBytes: int64(len(toolRaw))},
+	}
+	repo.rawParts["prt_task_unlinked"] = index.RawPart{PartID: "prt_task_unlinked", Kind: opencode.PartKindTool, ToolName: "task", Status: "completed", Title: "No child", RawJSON: taskRaw, SizeBytes: int64(len(taskRaw))}
+	repo.rawParts["prt_bash"] = index.RawPart{PartID: "prt_bash", Kind: opencode.PartKindTool, ToolName: "bash", Status: "completed", RawJSON: toolRaw, SizeBytes: int64(len(toolRaw))}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	model = sendKey(t, model, "j")
+	model = sendKey(t, model, "enter")
+	if model.mode != ViewRawPart || model.rawPart.PartID != "prt_task_unlinked" {
+		t.Fatalf("unlinked task should open detail, got mode=%v raw=%q", model.mode, model.rawPart.PartID)
+	}
+	model = sendKey(t, model, "h")
+	model = sendKey(t, model, "j")
+	model = sendKey(t, model, "enter")
+	if model.mode != ViewRawPart || model.rawPart.PartID != "prt_bash" {
+		t.Fatalf("ordinary tool should open detail, got mode=%v raw=%q", model.mode, model.rawPart.PartID)
+	}
+}
+
+func TestChildTimelineSearchAndBrowsingStayBounded(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions = append(repo.sessions, index.SessionSummary{ID: "ses_child", ParentID: "ses_project", ProjectID: "proj", ProjectPath: "/tmp/project", Title: "Child subagent"})
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_task", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "task", Status: "completed", Title: "Open child", SubagentName: "explore", LinkedSessionID: "ses_child"},
+	}
+	repo.timelines["ses_child"] = nil
+	for i := 0; i < 30; i++ {
+		repo.timelines["ses_child"] = append(repo.timelines["ses_child"], index.TimelinePart{
+			PartID:    fmt.Sprintf("prt_child_%02d", i),
+			SessionID: "ses_child",
+			MessageID: fmt.Sprintf("msg_child_%02d", i),
+			Role:      "assistant",
+			Kind:      opencode.PartKindText,
+			Preview:   fmt.Sprintf("child item %02d", i),
+			IndexText: fmt.Sprintf("child item %02d", i),
+		})
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 9})
+	model = sendKey(t, model, "l")
+	model = sendKey(t, model, "enter")
+	if strings.Contains(plainView(model.View()), "child item 20") {
+		t.Fatalf("child timeline render should be bounded:\n%s", model.View())
+	}
+	for i := 0; i < 8; i++ {
+		model = sendKey(t, model, "j")
+	}
+	plain := plainView(model.View())
+	if model.timelineScroll == 0 || strings.Contains(plain, "child item 00") || !strings.Contains(plain, "child item 08") {
+		t.Fatalf("child timeline browsing did not stay bounded and scrollable:\n%s", model.View())
+	}
+	model = search(t, model, "child item 05")
+	if repo.lastTimelineSearchSession != "ses_child" || len(model.timeline) != 1 || model.timeline[0].PartID != "prt_child_05" {
+		t.Fatalf("child timeline search = session:%q timeline:%#v", repo.lastTimelineSearchSession, model.timeline)
 	}
 }
 
@@ -647,6 +766,15 @@ func sessionHeaderLabels(rows []sessionListRow) []string {
 	return labels
 }
 
+func containsSessionID(sessions []index.SessionSummary, id string) bool {
+	for _, session := range sessions {
+		if session.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func groupSessionIDs(rows []sessionListRow, label string) []string {
 	var ids []string
 	inGroup := false
@@ -678,12 +806,13 @@ func requireSelectedSessionVisible(t *testing.T, model Model) {
 }
 
 type fakeRepo struct {
-	sessions           []index.SessionSummary
-	timelines          map[string][]index.TimelinePart
-	rawParts           map[string]index.RawPart
-	lastSessionSearch  string
-	lastTimelineSearch string
-	timelineLoads      int
+	sessions                  []index.SessionSummary
+	timelines                 map[string][]index.TimelinePart
+	rawParts                  map[string]index.RawPart
+	lastSessionSearch         string
+	lastTimelineSearchSession string
+	lastTimelineSearch        string
+	timelineLoads             int
 }
 
 func newFakeRepo(t *testing.T) *fakeRepo {
@@ -713,6 +842,15 @@ func (f *fakeRepo) ListSessions(context.Context) ([]index.SessionSummary, error)
 	return f.sessions, nil
 }
 
+func (f *fakeRepo) Session(_ context.Context, sessionID string) (index.SessionSummary, error) {
+	for _, session := range f.sessions {
+		if session.ID == sessionID {
+			return session, nil
+		}
+	}
+	return index.SessionSummary{}, fmt.Errorf("session %s not found", sessionID)
+}
+
 func (f *fakeRepo) SearchSessions(_ context.Context, query string) ([]index.SessionSummary, error) {
 	f.lastSessionSearch = query
 	var results []index.SessionSummary
@@ -730,6 +868,7 @@ func (f *fakeRepo) SessionTimeline(_ context.Context, sessionID string) ([]index
 }
 
 func (f *fakeRepo) SearchSession(_ context.Context, sessionID, query string) ([]index.TimelinePart, error) {
+	f.lastTimelineSearchSession = sessionID
 	f.lastTimelineSearch = query
 	var results []index.TimelinePart
 	for _, part := range f.timelines[sessionID] {

@@ -106,6 +106,7 @@ func scanSessions(root string) ([]Session, error) {
 		sessions = append(sessions, Session{
 			ID:          raw.ID,
 			ProjectID:   raw.ProjectID,
+			ParentID:    raw.ParentID,
 			Directory:   raw.Directory,
 			Title:       raw.Title,
 			Slug:        raw.Slug,
@@ -406,6 +407,7 @@ type rawSession struct {
 	Slug      string  `json:"slug"`
 	Version   string  `json:"version"`
 	ProjectID string  `json:"projectID"`
+	ParentID  string  `json:"parentID"`
 	Directory string  `json:"directory"`
 	Title     string  `json:"title"`
 	Time      rawTime `json:"time"`

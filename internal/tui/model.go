@@ -61,8 +61,19 @@ type sessionListGroup struct {
 	rows     []sessionListRow
 }
 
+type timelineContext struct {
+	session        index.SessionSummary
+	timeline       []index.TimelinePart
+	allTimeline    []index.TimelinePart
+	selectedPart   int
+	timelineScroll int
+	showReasoning  bool
+	renderMarkdown bool
+}
+
 type Repository interface {
 	ListSessions(context.Context) ([]index.SessionSummary, error)
+	Session(context.Context, string) (index.SessionSummary, error)
 	SearchSessions(context.Context, string) ([]index.SessionSummary, error)
 	SessionTimeline(context.Context, string) ([]index.TimelinePart, error)
 	SearchSession(context.Context, string, string) ([]index.TimelinePart, error)
@@ -78,6 +89,7 @@ type Model struct {
 	allSessions     []index.SessionSummary
 	timeline        []index.TimelinePart
 	allTimeline     []index.TimelinePart
+	timelineStack   []timelineContext
 	currentSession  index.SessionSummary
 	selectedSession int
 	selectedPart    int
@@ -116,6 +128,7 @@ var (
 )
 
 func NewModel(repo Repository, sessions []index.SessionSummary) Model {
+	sessions = topLevelSessions(sessions)
 	return Model{
 		repo:            repo,
 		mode:            ViewSessions,
@@ -251,7 +264,7 @@ func (m Model) applySearch() Model {
 		} else if sessions, err := m.repo.SearchSessions(ctx, query); err != nil {
 			m.lastErr = err
 		} else {
-			m.sessions = sessions
+			m.sessions = topLevelSessions(sessions)
 			m.selectSessionByID(selectedID, fallback)
 			m.lastErr = nil
 		}
@@ -336,6 +349,7 @@ func (m Model) openSelected() Model {
 		m.currentSession = session
 		m.timeline = parts
 		m.allTimeline = append([]index.TimelinePart(nil), parts...)
+		m.timelineStack = nil
 		m.timelineScroll = 0
 		m.showReasoning = false
 		m.renderMarkdown = true
@@ -350,12 +364,58 @@ func (m Model) openSelected() Model {
 		if len(m.timeline) == 0 || partIndex < 0 || partIndex >= len(m.timeline) || !isOpenablePart(m.timeline[partIndex]) {
 			return m
 		}
-		return m.openRawPart(m.timeline[partIndex].PartID)
+		part := m.timeline[partIndex]
+		if isLinkedTaskPart(part) {
+			return m.openLinkedSession(partIndex, part)
+		}
+		return m.openRawPart(part.PartID)
 	case ViewRawPart:
 		return m
 	default:
 		return m
 	}
+}
+
+func (m Model) openLinkedSession(parentPartIndex int, parentPart index.TimelinePart) Model {
+	childID := strings.TrimSpace(parentPart.LinkedSessionID)
+	parts, err := m.repo.SessionTimeline(context.Background(), childID)
+	if err != nil {
+		m.lastErr = err
+		return m
+	}
+	child, err := m.repo.Session(context.Background(), childID)
+	if err != nil {
+		child = index.SessionSummary{
+			ID:            childID,
+			ParentID:      m.currentSession.ID,
+			ProjectID:     m.currentSession.ProjectID,
+			ProjectPath:   m.currentSession.ProjectPath,
+			ModelProvider: m.currentSession.ModelProvider,
+			ModelID:       m.currentSession.ModelID,
+		}
+	}
+	if child.ParentID == "" {
+		child.ParentID = m.currentSession.ID
+	}
+	m.timelineStack = append(m.timelineStack, timelineContext{
+		session:        m.currentSession,
+		timeline:       append([]index.TimelinePart(nil), m.timeline...),
+		allTimeline:    append([]index.TimelinePart(nil), m.allTimeline...),
+		selectedPart:   parentPartIndex,
+		timelineScroll: m.timelineScroll,
+		showReasoning:  m.showReasoning,
+		renderMarkdown: m.renderMarkdown,
+	})
+	m.currentSession = child
+	m.timeline = parts
+	m.allTimeline = append([]index.TimelinePart(nil), parts...)
+	m.timelineScroll = 0
+	m.showReasoning = false
+	m.renderMarkdown = true
+	m.selectedPart = m.firstFocusablePartInViewport()
+	m.mode = ViewTimeline
+	m.lastErr = nil
+	return m
 }
 
 func (m Model) openRawPart(partID string) Model {
@@ -401,6 +461,20 @@ func (m Model) openRawPart(partID string) Model {
 func (m Model) back() Model {
 	switch m.mode {
 	case ViewTimeline:
+		if len(m.timelineStack) > 0 {
+			last := m.timelineStack[len(m.timelineStack)-1]
+			m.timelineStack = m.timelineStack[:len(m.timelineStack)-1]
+			m.currentSession = last.session
+			m.timeline = append([]index.TimelinePart(nil), last.timeline...)
+			m.allTimeline = append([]index.TimelinePart(nil), last.allTimeline...)
+			m.selectedPart = last.selectedPart
+			m.timelineScroll = last.timelineScroll
+			m.showReasoning = last.showReasoning
+			m.renderMarkdown = last.renderMarkdown
+			m.mode = ViewTimeline
+			m.ensureFocusedPartVisible()
+			break
+		}
 		m.mode = ViewSessions
 	case ViewRawPart:
 		m.mode = ViewTimeline
@@ -473,7 +547,7 @@ func (m Model) renderFooter() string {
 	case ViewSessions:
 		help = fmt.Sprintf("j/k move  l/Enter open  v %s view  / search  q quit", m.nextSessionListModeLabel())
 	case ViewTimeline:
-		help = fmt.Sprintf("j/k move focus  l/Enter details  r reasoning  %s  h back  / search  q quit", m.markdownToggleHelp())
+		help = fmt.Sprintf("j/k move focus  l/Enter open  r reasoning  %s  h back  / search  q quit", m.markdownToggleHelp())
 	case ViewRawPart:
 		toggle := "R raw JSON"
 		if m.rawMode {
@@ -577,6 +651,20 @@ func (m Model) sessionPreviewLines(height, width int) []string {
 
 func (m Model) renderTimeline(height int) string {
 	width := m.safeWidth()
+	header := m.timelineHeader(width)
+	contentHeight := max(1, height-len(header))
+	rows := m.transcriptRows(width)
+	maxScroll := max(0, len(rows)-contentHeight)
+	start := clamp(m.timelineScroll, 0, maxScroll)
+	window := rows[start:min(len(rows), start+contentHeight)]
+	lines := append([]string{}, header...)
+	for _, row := range window {
+		lines = append(lines, row.text)
+	}
+	return fitBlock(lines, height, width)
+}
+
+func (m Model) timelineHeader(width int) []string {
 	metadata := []string{
 		"Project: " + groupName(m.currentSession),
 		"Model: " + firstNonEmpty(m.currentSession.ModelProvider, "unknown") + "/" + firstNonEmpty(m.currentSession.ModelID, "unknown"),
@@ -589,16 +677,25 @@ func (m Model) renderTimeline(height int) string {
 		titleStyle.Render(truncatePlain(firstNonEmpty(m.currentSession.Title, m.currentSession.ID), width)),
 		dimStyle.Render(truncatePlain(strings.Join(metadata, "  "), width)),
 	}
-	contentHeight := max(1, height-len(header))
-	rows := m.transcriptRows(width)
-	maxScroll := max(0, len(rows)-contentHeight)
-	start := clamp(m.timelineScroll, 0, maxScroll)
-	window := rows[start:min(len(rows), start+contentHeight)]
-	lines := append([]string{}, header...)
-	for _, row := range window {
-		lines = append(lines, row.text)
+	if context := m.nestedTimelineContext(); context != "" {
+		header = append(header, dimStyle.Render(truncatePlain("Nested under: "+context, width)))
 	}
-	return fitBlock(lines, height, width)
+	return header
+}
+
+func (m Model) nestedTimelineContext() string {
+	if len(m.timelineStack) == 0 {
+		return ""
+	}
+	parent := m.timelineStack[len(m.timelineStack)-1]
+	label := firstNonEmpty(parent.session.Title, parent.session.ID)
+	if parent.selectedPart >= 0 && parent.selectedPart < len(parent.timeline) {
+		part := parent.timeline[parent.selectedPart]
+		if task := firstNonEmpty(part.Title, part.Preview, part.PartID); task != "" {
+			label += " via " + task
+		}
+	}
+	return label
 }
 
 func (m Model) transcriptRows(width int) []transcriptLine {
@@ -745,6 +842,14 @@ func compactPart(part index.TimelinePart) string {
 	flags := partFlags(part)
 	switch part.Kind {
 	case opencode.PartKindTool:
+		if isLinkedTaskPart(part) {
+			label := "[subagent]"
+			if part.SubagentName != "" {
+				label = "[subagent:" + part.SubagentName + "]"
+			}
+			fields := nonEmpty([]string{part.Status, part.Preview, "opens " + part.LinkedSessionID})
+			return strings.Join(append([]string{label + " " + firstNonEmpty(part.Title, part.LinkedSessionID)}, append(fields, flags...)...), " - ")
+		}
 		fields := nonEmpty([]string{part.Status, part.Title, shortPath(part.FilePath), part.Preview})
 		return strings.Join(append([]string{"[tool] " + firstNonEmpty(part.ToolName, "tool")}, append(fields, flags...)...), " - ")
 	case opencode.PartKindPatch:
@@ -1184,7 +1289,14 @@ func selectableRowAtOrNear(rows []sessionListRow, target, delta int) int {
 }
 
 func (m Model) timelineContentHeight() int {
-	return max(1, m.bodyHeight()-2)
+	return max(1, m.bodyHeight()-m.timelineHeaderHeight())
+}
+
+func (m Model) timelineHeaderHeight() int {
+	if len(m.timelineStack) > 0 {
+		return 3
+	}
+	return 2
 }
 
 func (m Model) maxTimelineScroll() int {
@@ -1377,6 +1489,10 @@ func isOpenablePart(part index.TimelinePart) bool {
 	}
 }
 
+func isLinkedTaskPart(part index.TimelinePart) bool {
+	return part.Kind == opencode.PartKindTool && strings.EqualFold(strings.TrimSpace(part.ToolName), "task") && strings.TrimSpace(part.LinkedSessionID) != ""
+}
+
 func (m Model) isFocusablePart(part index.TimelinePart) bool {
 	switch part.Kind {
 	case opencode.PartKindStepStart, opencode.PartKindStepFinish:
@@ -1406,6 +1522,16 @@ func groupName(session index.SessionSummary) string {
 		return "Global sessions"
 	}
 	return firstNonEmpty(session.ProjectPath, session.ProjectID, "Unknown project")
+}
+
+func topLevelSessions(sessions []index.SessionSummary) []index.SessionSummary {
+	out := make([]index.SessionSummary, 0, len(sessions))
+	for _, session := range sessions {
+		if strings.TrimSpace(session.ParentID) == "" {
+			out = append(out, session)
+		}
+	}
+	return out
 }
 
 func marker(selected bool) string {

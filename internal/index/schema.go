@@ -19,6 +19,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   project_id TEXT,
+  parent_id TEXT,
   project_path TEXT,
   directory TEXT,
   title TEXT,
@@ -62,6 +63,8 @@ func (s *Store) initSchema(ctx context.Context) error {
   tool_name TEXT,
   status TEXT,
   title TEXT,
+  subagent_name TEXT,
+  linked_session_id TEXT,
   file_path TEXT,
   mime TEXT,
   filename TEXT,
@@ -118,6 +121,15 @@ func (s *Store) initSchema(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "parts", "raw_json", "TEXT"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "sessions", "parent_id", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "parts", "linked_session_id", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "parts", "subagent_name", "TEXT"); err != nil {
+		return err
+	}
 	for _, column := range []struct {
 		name       string
 		definition string
@@ -132,6 +144,14 @@ func (s *Store) initSchema(ctx context.Context) error {
 	} {
 		if err := s.ensureColumn(ctx, "sessions", column.name, column.definition); err != nil {
 			return err
+		}
+	}
+	for _, statement := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_parts_linked_session ON parts(linked_session_id)`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("initialize schema: %w", err)
 		}
 	}
 	return nil
