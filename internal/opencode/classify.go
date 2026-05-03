@@ -1,16 +1,23 @@
 package opencode
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"unicode/utf8"
 )
 
+const heavyPartProbeBytes = 256 * 1024
+
 func classifyPart(path string, info fs.FileInfo, raw []byte) (Part, error) {
+	if info.Size() > DefaultHeavyFileBytes {
+		return classifyHeavyPartBytes(path, info, raw), nil
+	}
 	var data map[string]any
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return Part{}, fmt.Errorf("parse %s: %w", path, err)
@@ -61,6 +68,164 @@ func classifyPart(path string, info fs.FileInfo, raw []byte) (Part, error) {
 		part.RawJSON = string(raw)
 	}
 	return part, nil
+}
+
+func classifyHeavyPartFile(path string, info fs.FileInfo) (Part, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return Part{}, fmt.Errorf("read heavy part prefix %s: %w", path, err)
+	}
+	defer file.Close()
+	prefix := make([]byte, heavyPartProbeBytes)
+	n, err := file.Read(prefix)
+	if err != nil && n == 0 {
+		return Part{}, fmt.Errorf("read heavy part prefix %s: %w", path, err)
+	}
+	return classifyHeavyPartPrefix(path, info, prefix[:n]), nil
+}
+
+func classifyHeavyPartBytes(path string, info fs.FileInfo, raw []byte) Part {
+	if len(raw) > heavyPartProbeBytes {
+		raw = raw[:heavyPartProbeBytes]
+	}
+	return classifyHeavyPartPrefix(path, info, raw)
+}
+
+func classifyHeavyPartPrefix(path string, info fs.FileInfo, prefix []byte) Part {
+	typeName := shallowJSONString(prefix, "type")
+	part := Part{
+		ID:         firstNonEmpty(shallowJSONString(prefix, "id"), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))),
+		SessionID:  shallowJSONString(prefix, "sessionID"),
+		MessageID:  shallowJSONString(prefix, "messageID"),
+		Type:       typeName,
+		Kind:       classifyKind(typeName),
+		ToolName:   shallowJSONString(prefix, "tool"),
+		Status:     shallowJSONString(prefix, "status"),
+		Title:      firstNonEmpty(shallowJSONString(prefix, "title"), shallowJSONString(prefix, "description")),
+		MIME:       shallowJSONString(prefix, "mime"),
+		Filename:   shallowJSONString(prefix, "filename"),
+		CreatedAt:  unixMilli(shallowJSONInt(prefix, "start")),
+		UpdatedAt:  unixMilli(shallowJSONInt(prefix, "end")),
+		SizeBytes:  info.Size(),
+		Heavy:      true,
+		SkippedRaw: true,
+		Source:     fileRecord(path, info),
+	}
+	if part.MessageID == "" {
+		part.MessageID = filepath.Base(filepath.Dir(path))
+	}
+	part.Binary = part.Kind == PartKindFile && containsDataURL(shallowJSONString(prefix, "url"))
+	part.SubagentName = firstNonEmpty(
+		shallowJSONString(prefix, "subagent_type"),
+		shallowJSONString(prefix, "subagentType"),
+		shallowJSONString(prefix, "subagent"),
+		shallowJSONString(prefix, "subagentName"),
+		shallowJSONString(prefix, "agent_type"),
+		shallowJSONString(prefix, "agentType"),
+		shallowJSONString(prefix, "agent"),
+		shallowJSONString(prefix, "agentName"),
+	)
+	part.LinkedSessionID = shallowJSONString(prefix, "sessionId")
+	part.FilePath = firstNonEmpty(shallowJSONString(prefix, "path"), part.Filename)
+
+	switch part.Kind {
+	case PartKindText, PartKindReasoning:
+		part.Preview = fmt.Sprintf("%s part skipped (%d bytes)", part.Kind, info.Size())
+	case PartKindTool:
+		fields := []string{"tool", part.ToolName, part.Status, part.Title, part.SubagentName, part.LinkedSessionID}
+		for _, key := range []string{"command", "description", "workdir", "path", "file", "pattern"} {
+			fields = append(fields, shallowJSONString(prefix, key))
+		}
+		part.IndexText = strings.Join(nonEmpty(fields), " ")
+		part.Preview = firstNonEmpty(part.Title, fmt.Sprintf("%s %s (heavy raw payload skipped)", part.ToolName, part.Status), "tool part (heavy raw payload skipped)")
+	case PartKindPatch:
+		part.IndexText = strings.Join(nonEmpty([]string{"patch", part.Title, part.FilePath}), " ")
+		part.Preview = firstNonEmpty(part.Title, "patch part (heavy raw payload skipped)")
+	case PartKindFile:
+		part.IndexText = strings.Join(nonEmpty([]string{"file", part.FilePath, part.Filename, part.MIME}), " ")
+		part.Preview = firstNonEmpty(part.FilePath, part.Filename, part.MIME, "file part (heavy raw payload skipped)")
+	case PartKindStepStart:
+		part.Preview = "step start"
+	case PartKindStepFinish:
+		part.Preview = "step finish"
+	default:
+		part.Preview = "unknown part (heavy raw payload skipped)"
+	}
+	part.IndexText = normalizeIndexText(part.IndexText)
+	part.Preview = bounded(strings.TrimSpace(part.Preview), previewRunes)
+	return part
+}
+
+func shallowJSONString(prefix []byte, key string) string {
+	needle := []byte(`"` + key + `"`)
+	for search := prefix; len(search) > 0; {
+		idx := bytes.Index(search, needle)
+		if idx < 0 {
+			return ""
+		}
+		rest := search[idx+len(needle):]
+		colon := bytes.IndexByte(rest, ':')
+		if colon < 0 {
+			return ""
+		}
+		rest = bytes.TrimLeft(rest[colon+1:], " \t\r\n")
+		if len(rest) == 0 {
+			return ""
+		}
+		if rest[0] != '"' {
+			search = rest[1:]
+			continue
+		}
+		end := 1
+		escaped := false
+		for ; end < len(rest); end++ {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch rest[end] {
+			case '\\':
+				escaped = true
+			case '"':
+				var value string
+				if err := json.Unmarshal(rest[:end+1], &value); err == nil {
+					return value
+				}
+				return ""
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+func shallowJSONInt(prefix []byte, key string) int64 {
+	needle := []byte(`"` + key + `"`)
+	idx := bytes.Index(prefix, needle)
+	if idx < 0 {
+		return 0
+	}
+	rest := prefix[idx+len(needle):]
+	colon := bytes.IndexByte(rest, ':')
+	if colon < 0 {
+		return 0
+	}
+	rest = bytes.TrimLeft(rest[colon+1:], " \t\r\n")
+	end := 0
+	for end < len(rest) && ((rest[end] >= '0' && rest[end] <= '9') || rest[end] == '-') {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	var value int64
+	for _, b := range rest[:end] {
+		if b < '0' || b > '9' {
+			return 0
+		}
+		value = value*10 + int64(b-'0')
+	}
+	return value
 }
 
 func classifyKind(typeName string) PartKind {

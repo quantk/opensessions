@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/quantick/opensession/internal/opencode"
 )
@@ -242,6 +243,84 @@ func TestStoreSubagentMetadataAndTopLevelQueries(t *testing.T) {
 	}
 }
 
+func TestStoreBatchScanMetadataAndIncrementalUpsert(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	root := filepath.Join(t.TempDir(), "storage")
+	base := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	snapshot := incrementalSnapshot(root, base, "old text", "old text")
+	if err := store.UpsertSnapshot(ctx, snapshot); err != nil {
+		t.Fatalf("UpsertSnapshot first: %v", err)
+	}
+	partSource := snapshot.Sessions[0].Messages[0].Parts[0].Source
+	metadata, err := store.ScanMetadataBatch(ctx, []string{partSource.Path, partSource.Path, filepath.Join(root, "missing.json")})
+	if err != nil {
+		t.Fatalf("ScanMetadataBatch: %v", err)
+	}
+	if len(metadata) != 1 || metadata[partSource.Path].SizeBytes != partSource.SizeBytes || !metadata[partSource.Path].ModTime.Equal(partSource.ModTime) {
+		t.Fatalf("batch metadata = %#v", metadata)
+	}
+
+	mustExec(t, store.db, `CREATE TABLE update_count (table_name TEXT)`)
+	mustExec(t, store.db, `CREATE TRIGGER count_session_update AFTER UPDATE ON sessions BEGIN INSERT INTO update_count (table_name) VALUES ('sessions'); END`)
+	mustExec(t, store.db, `CREATE TRIGGER count_part_update AFTER UPDATE ON parts BEGIN INSERT INTO update_count (table_name) VALUES ('parts'); END`)
+	if err := store.UpsertSnapshot(ctx, snapshot); err != nil {
+		t.Fatalf("UpsertSnapshot unchanged: %v", err)
+	}
+	if got := updateCount(t, store); got != 0 {
+		t.Fatalf("unchanged upsert rewrote rows, update count=%d", got)
+	}
+
+	changed := incrementalSnapshot(root, base, "new text", "new text")
+	changed.Sessions[0].Messages[0].Parts[0].Source.ModTime = base.Add(time.Minute)
+	changed.Sessions[0].Messages[0].Parts[0].Source.SizeBytes++
+	if err := store.UpsertSnapshot(ctx, changed); err != nil {
+		t.Fatalf("UpsertSnapshot changed: %v", err)
+	}
+	if got := updateCount(t, store); got == 0 {
+		t.Fatalf("changed part did not refresh dependent rows")
+	}
+	timeline, err := store.SearchSession(ctx, "ses", "new text")
+	if err != nil {
+		t.Fatalf("SearchSession new text: %v", err)
+	}
+	if len(timeline) != 1 || timeline[0].PartID != "prt" || timeline[0].Preview != "new text" {
+		t.Fatalf("changed part not searchable/refreshed: %#v", timeline)
+	}
+	old, err := store.SearchSession(ctx, "ses", "old text")
+	if err != nil {
+		t.Fatalf("SearchSession old text: %v", err)
+	}
+	if len(old) != 0 {
+		t.Fatalf("stale searchable document remained: %#v", old)
+	}
+
+	removed := incrementalSnapshot(root, base, "", "")
+	removed.Sessions[0].PartCount = 0
+	removed.Sessions[0].Messages[0].Parts = nil
+	if err := store.UpsertSnapshot(ctx, removed); err != nil {
+		t.Fatalf("UpsertSnapshot removed part: %v", err)
+	}
+	timeline, err = store.SessionTimeline(ctx, "ses")
+	if err != nil {
+		t.Fatalf("SessionTimeline removed: %v", err)
+	}
+	if len(timeline) != 0 {
+		t.Fatalf("stale part remained after reconciliation: %#v", timeline)
+	}
+	summary, err := store.Session(ctx, "ses")
+	if err != nil {
+		t.Fatalf("Session summary removed: %v", err)
+	}
+	if summary.PartCount != 0 {
+		t.Fatalf("session summary was not refreshed after stale part deletion: %#v", summary)
+	}
+}
+
 func TestOpenMigratesExistingDatabaseForSubagentColumns(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "opensession.sqlite")
 	db, err := sql.Open("sqlite", dbPath)
@@ -323,6 +402,54 @@ func findTimelinePart(t *testing.T, parts []TimelinePart, id string) TimelinePar
 	}
 	t.Fatalf("timeline part %q not found", id)
 	return TimelinePart{}
+}
+
+func incrementalSnapshot(root string, modTime time.Time, preview, indexText string) opencode.Snapshot {
+	part := opencode.Part{
+		ID:        "prt",
+		SessionID: "ses",
+		MessageID: "msg",
+		Kind:      opencode.PartKindText,
+		Preview:   preview,
+		IndexText: indexText,
+		Source:    opencode.FileRecord{Path: filepath.Join(root, "part", "msg", "prt.json"), SizeBytes: int64(len(indexText) + 1), ModTime: modTime},
+	}
+	return opencode.Snapshot{
+		Root: root,
+		Projects: []opencode.Project{{
+			ID:       "proj",
+			Worktree: "/tmp/project",
+			Source:   opencode.FileRecord{Path: filepath.Join(root, "project", "proj.json"), SizeBytes: 10, ModTime: modTime},
+		}},
+		Sessions: []opencode.Session{{
+			ID:           "ses",
+			ProjectID:    "proj",
+			ProjectPath:  "/tmp/project",
+			Title:        "Session",
+			MessageCount: 1,
+			PartCount:    1,
+			Source:       opencode.FileRecord{Path: filepath.Join(root, "session", "proj", "ses.json"), SizeBytes: 11, ModTime: modTime},
+			Messages: []opencode.Message{{
+				ID:        "msg",
+				SessionID: "ses",
+				Role:      "assistant",
+				Source:    opencode.FileRecord{Path: filepath.Join(root, "message", "ses", "msg.json"), SizeBytes: 12, ModTime: modTime},
+				Parts:     []opencode.Part{part},
+			}},
+		}},
+	}
+}
+
+func updateCount(t *testing.T, store *Store) int {
+	t.Helper()
+	var count int
+	if err := store.db.QueryRow(`SELECT count(*) FROM update_count`).Scan(&count); err != nil {
+		t.Fatalf("update count: %v", err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM update_count`); err != nil {
+		t.Fatalf("clear update count: %v", err)
+	}
+	return count
 }
 
 func columnExists(t *testing.T, store *Store, table, column string) bool {

@@ -49,6 +49,13 @@ func (s *Store) initSchema(ctx context.Context) error {
   summary_title TEXT,
   model_provider TEXT,
   model_id TEXT,
+  token_usage_available INTEGER NOT NULL DEFAULT 0,
+  token_total INTEGER NOT NULL DEFAULT 0,
+  token_input INTEGER NOT NULL DEFAULT 0,
+  token_output INTEGER NOT NULL DEFAULT 0,
+  token_reasoning INTEGER NOT NULL DEFAULT 0,
+  token_cache_read INTEGER NOT NULL DEFAULT 0,
+  token_cache_write INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER,
   updated_at INTEGER,
   source_path TEXT,
@@ -112,6 +119,13 @@ func (s *Store) initSchema(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_parts_session ON parts(session_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_searchable_session ON searchable_documents(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_searchable_session_part ON searchable_documents(session_id, part_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_searchable_part ON searchable_documents(part_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_tags_tag_session ON tags(tag, session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_projects_source ON projects(source_path)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source_path)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source_path)`,
+		`CREATE INDEX IF NOT EXISTS idx_parts_source ON parts(source_path)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -143,6 +157,22 @@ func (s *Store) initSchema(ctx context.Context) error {
 		{"token_cache_write", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.ensureColumn(ctx, "sessions", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{"token_usage_available", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_total", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_input", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_output", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_reasoning", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_cache_read", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_cache_write", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn(ctx, "messages", column.name, column.definition); err != nil {
 			return err
 		}
 	}

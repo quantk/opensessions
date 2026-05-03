@@ -8,7 +8,12 @@ import (
 	termansi "github.com/charmbracelet/x/ansi"
 )
 
+var assistantMarkdownRowsHook func()
+
 func assistantMarkdownRows(source string, width int) (rows []string) {
+	if assistantMarkdownRowsHook != nil {
+		assistantMarkdownRowsHook()
+	}
 	width = max(12, width)
 	defer func() {
 		if recover() != nil {

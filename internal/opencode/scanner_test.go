@@ -182,6 +182,81 @@ func TestScanIncludesSQLiteDatabaseSessions(t *testing.T) {
 	}
 }
 
+func TestScanSkipsDuplicateJSONWhenDatabaseHasCurrentRecord(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "opencode", "storage")
+	if err := os.MkdirAll(filepath.Join(root, "part", "msg_db"), 0o755); err != nil {
+		t.Fatalf("mkdir duplicate json: %v", err)
+	}
+	mustWriteFile(t, filepath.Join(root, "part", "msg_db", "prt_db_text.json"), `{not valid json`)
+	dbPath := filepath.Join(base, "opencode", "opencode.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite fixture: %v", err)
+	}
+	defer db.Close()
+	mustExec(t, db, `CREATE TABLE project (id text PRIMARY KEY, worktree text NOT NULL, vcs text, time_created integer NOT NULL, time_updated integer NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE session (id text PRIMARY KEY, project_id text NOT NULL, slug text NOT NULL, directory text NOT NULL, title text NOT NULL, version text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`)
+	mustExec(t, db, `INSERT INTO project (id, worktree, vcs, time_created, time_updated) VALUES ('proj-db', '/tmp/db-project', 'git', 1777800000000, 1777800000000)`)
+	mustExec(t, db, `INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('ses_db', 'proj-db', 'fresh', '/tmp/db-project', 'Fresh database session', '1.2.3', 1777800000000, 1777800100000)`)
+	mustExec(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_db', 'ses_db', 1777800001000, 1777800001000, '{"role":"user"}')`)
+	mustExec(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_db_text', 'msg_db', 'ses_db', 1777800001000, 1777800001000, '{"type":"text","text":"database duplicate wins"}')`)
+
+	snapshot, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan with duplicate invalid JSON: %v", err)
+	}
+	part := findPart(t, findSession(t, snapshot, "ses_db"), "prt_db_text")
+	if !strings.Contains(part.IndexText, "database duplicate wins") || !strings.Contains(part.Source.Path, "opencode.db#part/prt_db_text.json") {
+		t.Fatalf("database duplicate was not selected: %#v", part)
+	}
+}
+
+func TestScanWithMetadataReusesUnchangedPart(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "project", "proj.json"), `{"id":"proj","worktree":"/tmp/project"}`)
+	mustWriteFile(t, filepath.Join(root, "session", "proj", "ses.json"), `{"id":"ses","projectID":"proj","directory":"/tmp/project","title":"Session"}`)
+	mustWriteFile(t, filepath.Join(root, "message", "ses", "msg.json"), `{"id":"msg","sessionID":"ses","role":"assistant"}`)
+	partPath := filepath.Join(root, "part", "msg", "prt_reused.json")
+	mustWriteFile(t, partPath, `{not valid json but unchanged}`)
+	info, err := os.Stat(partPath)
+	if err != nil {
+		t.Fatalf("stat part: %v", err)
+	}
+	source := fileRecord(partPath, info)
+	existing := Snapshot{Sessions: []Session{{ID: "ses", ProjectID: "proj", Source: FileRecord{Path: filepath.Join(root, "session", "proj", "ses.json")}, Messages: []Message{{ID: "msg", SessionID: "ses", Source: FileRecord{Path: filepath.Join(root, "message", "ses", "msg.json")}, Parts: []Part{{ID: "prt_reused", SessionID: "ses", MessageID: "msg", Kind: PartKindTool, Preview: "reused preview", Source: source}}}}}}}
+	snapshot, err := ScanWithMetadata(root, map[string]FileRecord{partPath: source}, existing)
+	if err != nil {
+		t.Fatalf("ScanWithMetadata: %v", err)
+	}
+	part := findPart(t, findSession(t, snapshot, "ses"), "prt_reused")
+	if part.Preview != "reused preview" {
+		t.Fatalf("unchanged part was reparsed instead of reused: %#v", part)
+	}
+}
+
+func TestScanShortCircuitsHeavyPartPayload(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "project", "proj.json"), `{"id":"proj","worktree":"/tmp/project"}`)
+	mustWriteFile(t, filepath.Join(root, "session", "proj", "ses.json"), `{"id":"ses","projectID":"proj","directory":"/tmp/project","title":"Session"}`)
+	mustWriteFile(t, filepath.Join(root, "message", "ses", "msg.json"), `{"id":"msg","sessionID":"ses","role":"assistant"}`)
+	heavyOutput := strings.Repeat("A", int(DefaultHeavyFileBytes)+1)
+	mustWriteFile(t, filepath.Join(root, "part", "msg", "prt_heavy_prefix.json"), `{"id":"prt_heavy_prefix","sessionID":"ses","messageID":"msg","type":"tool","tool":"bash","state":{"status":"completed","title":"Huge output","output":"`+heavyOutput+`"}}`)
+	snapshot, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	part := findPart(t, findSession(t, snapshot, "ses"), "prt_heavy_prefix")
+	if !part.Heavy || !part.SkippedRaw || part.RawJSON != "" || !strings.Contains(part.Preview, "Huge output") {
+		t.Fatalf("heavy part was not shallow-classified safely: %#v", part)
+	}
+	if strings.Contains(part.IndexText, heavyOutput[:64]) || strings.Contains(part.Preview, heavyOutput[:64]) {
+		t.Fatalf("heavy payload leaked into shallow classification")
+	}
+}
+
 func TestScanIncludesSQLiteDatabaseChildSessions(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "opencode", "storage")

@@ -20,6 +20,60 @@ const (
 )
 
 func Scan(root string) (Snapshot, error) {
+	return scan(root, scanOptions{})
+}
+
+func ScanWithMetadata(root string, metadata map[string]FileRecord, existing Snapshot) (Snapshot, error) {
+	return scan(root, scanOptions{metadata: metadata, existing: reusableRecordsFromSnapshot(existing)})
+}
+
+func DiscoverSourcePaths(root string) ([]string, error) {
+	root = filepath.Clean(root)
+	info, err := os.Stat(root)
+	if err != nil {
+		return nil, fmt.Errorf("stat storage root: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("storage root is not a directory: %s", root)
+	}
+	dbSources, err := discoverDatabaseSources(root)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0)
+	appendJSONPaths := func(kind, dir string, dbIDs map[string]FileRecord) error {
+		return walkJSON(filepath.Join(root, dir), func(path string, info fs.FileInfo) error {
+			id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+			if _, duplicate := dbIDs[id]; duplicate {
+				return nil
+			}
+			paths = append(paths, path)
+			_ = kind
+			return nil
+		})
+	}
+	if err := appendJSONPaths("project", "project", dbSources.projects); err != nil {
+		return nil, err
+	}
+	if err := appendJSONPaths("session", "session", dbSources.sessions); err != nil {
+		return nil, err
+	}
+	if err := appendJSONPaths("message", "message", dbSources.messages); err != nil {
+		return nil, err
+	}
+	if err := appendJSONPaths("part", "part", dbSources.parts); err != nil {
+		return nil, err
+	}
+	for _, sources := range []map[string]FileRecord{dbSources.projects, dbSources.sessions, dbSources.messages, dbSources.parts} {
+		for _, source := range sources {
+			paths = append(paths, source.Path)
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func scan(root string, options scanOptions) (Snapshot, error) {
 	root = filepath.Clean(root)
 	info, err := os.Stat(root)
 	if err != nil {
@@ -28,24 +82,29 @@ func Scan(root string) (Snapshot, error) {
 	if !info.IsDir() {
 		return Snapshot{}, fmt.Errorf("storage root is not a directory: %s", root)
 	}
+	dbSources, err := discoverDatabaseSources(root)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	options.dbSources = dbSources
 
-	projects, err := scanProjects(root)
+	projects, err := scanProjects(root, options)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	sessions, err := scanSessions(root)
+	sessions, err := scanSessions(root, options)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	messages, err := scanMessages(root)
+	messages, err := scanMessages(root, options)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	parts, err := scanParts(root)
+	parts, err := scanParts(root, options)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	dbProjects, dbSessions, dbMessages, dbParts, err := scanDatabaseForStorageRoot(root)
+	dbProjects, dbSessions, dbMessages, dbParts, err := scanDatabaseForStorageRoot(root, options)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -62,9 +121,75 @@ func Scan(root string) (Snapshot, error) {
 	return Snapshot{Root: root, Projects: projects, Sessions: assembled}, nil
 }
 
-func scanProjects(root string) ([]Project, error) {
+type scanOptions struct {
+	metadata  map[string]FileRecord
+	existing  reusableRecords
+	dbSources databaseSources
+}
+
+type reusableRecords struct {
+	projects map[string]Project
+	sessions map[string]Session
+	messages map[string]Message
+	parts    map[string]Part
+}
+
+func reusableRecordsFromSnapshot(snapshot Snapshot) reusableRecords {
+	records := reusableRecords{
+		projects: map[string]Project{},
+		sessions: map[string]Session{},
+		messages: map[string]Message{},
+		parts:    map[string]Part{},
+	}
+	for _, project := range snapshot.Projects {
+		if project.Source.Path != "" {
+			records.projects[project.Source.Path] = project
+		}
+	}
+	for _, session := range snapshot.Sessions {
+		if session.Source.Path != "" {
+			sessionRecord := session
+			sessionRecord.Messages = nil
+			records.sessions[session.Source.Path] = sessionRecord
+		}
+		for _, message := range session.Messages {
+			if message.Source.Path != "" {
+				messageRecord := message
+				messageRecord.Parts = nil
+				records.messages[message.Source.Path] = messageRecord
+			}
+			for _, part := range message.Parts {
+				if part.Source.Path != "" {
+					records.parts[part.Source.Path] = part
+				}
+			}
+		}
+	}
+	return records
+}
+
+func (o scanOptions) unchanged(source FileRecord) bool {
+	if source.Path == "" || o.metadata == nil {
+		return false
+	}
+	metadata, ok := o.metadata[source.Path]
+	return ok && metadata.SizeBytes == source.SizeBytes && metadata.ModTime.Equal(source.ModTime)
+}
+
+func scanProjects(root string, options scanOptions) ([]Project, error) {
 	var projects []Project
 	err := walkJSON(filepath.Join(root, "project"), func(path string, info fs.FileInfo) error {
+		id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		if _, duplicate := options.dbSources.projects[id]; duplicate {
+			return nil
+		}
+		source := fileRecord(path, info)
+		if options.unchanged(source) {
+			if project, ok := options.existing.projects[source.Path]; ok {
+				projects = append(projects, project)
+				return nil
+			}
+		}
 		var raw rawProject
 		if err := readJSON(path, &raw); err != nil {
 			return err
@@ -78,7 +203,7 @@ func scanProjects(root string) ([]Project, error) {
 			VCS:       raw.VCS,
 			CreatedAt: unixMilli(raw.Time.Created),
 			UpdatedAt: unixMilli(raw.Time.Updated),
-			Source:    fileRecord(path, info),
+			Source:    source,
 		})
 		return nil
 	})
@@ -89,10 +214,21 @@ func scanProjects(root string) ([]Project, error) {
 	return projects, nil
 }
 
-func scanSessions(root string) ([]Session, error) {
+func scanSessions(root string, options scanOptions) ([]Session, error) {
 	var sessions []Session
 	sessionRoot := filepath.Join(root, "session")
 	err := walkJSON(sessionRoot, func(path string, info fs.FileInfo) error {
+		id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		if _, duplicate := options.dbSources.sessions[id]; duplicate {
+			return nil
+		}
+		source := fileRecord(path, info)
+		if options.unchanged(source) {
+			if session, ok := options.existing.sessions[source.Path]; ok {
+				sessions = append(sessions, session)
+				return nil
+			}
+		}
 		var raw rawSession
 		if err := readJSON(path, &raw); err != nil {
 			return err
@@ -113,7 +249,7 @@ func scanSessions(root string) ([]Session, error) {
 			Version:     raw.Version,
 			CreatedAt:   unixMilli(raw.Time.Created),
 			UpdatedAt:   unixMilli(raw.Time.Updated),
-			Source:      fileRecord(path, info),
+			Source:      source,
 			ProjectPath: raw.Directory,
 		})
 		return nil
@@ -124,9 +260,20 @@ func scanSessions(root string) ([]Session, error) {
 	return sessions, nil
 }
 
-func scanMessages(root string) ([]Message, error) {
+func scanMessages(root string, options scanOptions) ([]Message, error) {
 	var messages []Message
 	err := walkJSON(filepath.Join(root, "message"), func(path string, info fs.FileInfo) error {
+		id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		if _, duplicate := options.dbSources.messages[id]; duplicate {
+			return nil
+		}
+		source := fileRecord(path, info)
+		if options.unchanged(source) {
+			if message, ok := options.existing.messages[source.Path]; ok {
+				messages = append(messages, message)
+				return nil
+			}
+		}
 		var raw rawMessage
 		if err := readJSON(path, &raw); err != nil {
 			return err
@@ -147,7 +294,7 @@ func scanMessages(root string) ([]Message, error) {
 			ModelID:       raw.Model.ModelID,
 			CreatedAt:     unixMilli(raw.Time.Created),
 			UpdatedAt:     unixMilli(raw.Time.Updated),
-			Source:        fileRecord(path, info),
+			Source:        source,
 		}
 		if strings.EqualFold(message.Role, "assistant") {
 			message.TokenUsage = parseRawTokenUsage(raw.Tokens)
@@ -161,9 +308,28 @@ func scanMessages(root string) ([]Message, error) {
 	return messages, nil
 }
 
-func scanParts(root string) ([]Part, error) {
+func scanParts(root string, options scanOptions) ([]Part, error) {
 	var parts []Part
 	err := walkJSON(filepath.Join(root, "part"), func(path string, info fs.FileInfo) error {
+		id := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		if _, duplicate := options.dbSources.parts[id]; duplicate {
+			return nil
+		}
+		source := fileRecord(path, info)
+		if options.unchanged(source) {
+			if part, ok := options.existing.parts[source.Path]; ok {
+				parts = append(parts, part)
+				return nil
+			}
+		}
+		if info.Size() > DefaultHeavyFileBytes {
+			part, err := classifyHeavyPartFile(path, info)
+			if err != nil {
+				return err
+			}
+			parts = append(parts, part)
+			return nil
+		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", path, err)
@@ -206,6 +372,15 @@ func assembleSessions(projects []Project, sessions []Session, messages []Message
 
 	assembled := make([]Session, 0, len(sessions))
 	for _, session := range sessions {
+		storedProvider := session.ModelProvider
+		storedModelID := session.ModelID
+		storedUsage := session.TokenUsage
+		session.ModelProvider = ""
+		session.ModelID = ""
+		session.MessageCount = 0
+		session.PartCount = 0
+		session.HeavyPartCount = 0
+		session.TokenUsage = TokenUsage{}
 		if project, ok := projectsByID[session.ProjectID]; ok && project.Worktree != "" {
 			session.ProjectPath = project.Worktree
 		} else if session.ProjectID == "global" && session.ProjectPath == "" {
@@ -236,6 +411,15 @@ func assembleSessions(projects []Project, sessions []Session, messages []Message
 			}
 		}
 		session.MessageCount = len(session.Messages)
+		if session.ModelProvider == "" {
+			session.ModelProvider = storedProvider
+		}
+		if session.ModelID == "" {
+			session.ModelID = storedModelID
+		}
+		if !session.TokenUsage.Available && storedUsage.Available {
+			session.TokenUsage = storedUsage
+		}
 		assembled = append(assembled, session)
 	}
 	sort.SliceStable(assembled, func(i, j int) bool {

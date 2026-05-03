@@ -49,7 +49,19 @@ func run(args []string) error {
 
 	ctx := context.Background()
 	if !cfg.NoScan {
-		snapshot, err := opencode.Scan(cfg.StorageRoot)
+		paths, err := opencode.DiscoverSourcePaths(cfg.StorageRoot)
+		if err != nil {
+			return err
+		}
+		metadata, err := store.ScanMetadataBatch(ctx, paths)
+		if err != nil {
+			return err
+		}
+		existing, err := store.Snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		snapshot, err := opencode.ScanWithMetadata(cfg.StorageRoot, opencodeMetadata(metadata), existing)
 		if err != nil {
 			return err
 		}
@@ -65,4 +77,12 @@ func run(args []string) error {
 	program := tea.NewProgram(tui.NewModel(store, sessions), tea.WithAltScreen())
 	_, err = program.Run()
 	return err
+}
+
+func opencodeMetadata(metadata map[string]index.ScanMetadata) map[string]opencode.FileRecord {
+	out := make(map[string]opencode.FileRecord, len(metadata))
+	for path, record := range metadata {
+		out[path] = opencode.FileRecord{Path: record.Path, SizeBytes: record.SizeBytes, ModTime: record.ModTime}
+	}
+	return out
 }

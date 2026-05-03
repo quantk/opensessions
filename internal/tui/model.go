@@ -71,6 +71,66 @@ type timelineContext struct {
 	renderMarkdown bool
 }
 
+type timelineDisplayCache struct {
+	textByPartID map[string]string
+	markdownRows map[markdownCacheKey][]string
+	layoutKey    timelineLayoutKey
+	layout       *timelineLayout
+}
+
+type markdownCacheKey struct {
+	partID  string
+	content string
+	width   int
+}
+
+type timelineLayoutKey struct {
+	revision       int
+	width          int
+	showReasoning  bool
+	renderMarkdown bool
+}
+
+type timelineLayout struct {
+	rows   []timelineLayoutRow
+	ranges []timelineRowRange
+}
+
+type timelineLayoutRowKind int
+
+const (
+	timelineLayoutRowEmpty timelineLayoutRowKind = iota
+	timelineLayoutRowSpacer
+	timelineLayoutRowHeader
+	timelineLayoutRowPart
+)
+
+type timelineLayoutRow struct {
+	kind      timelineLayoutRowKind
+	partIndex int
+	rowIndex  int
+}
+
+type timelineRowRange struct {
+	start int
+	end   int
+}
+
+type sessionSearchResultMsg struct {
+	requestID int
+	query     string
+	sessions  []index.SessionSummary
+	err       error
+}
+
+type timelineSearchResultMsg struct {
+	requestID int
+	sessionID string
+	query     string
+	parts     []index.TimelinePart
+	err       error
+}
+
 type Repository interface {
 	ListSessions(context.Context) ([]index.SessionSummary, error)
 	Session(context.Context, string) (index.SessionSummary, error)
@@ -98,6 +158,8 @@ type Model struct {
 	rawScroll       int
 
 	searchMode     bool
+	searchLoading  bool
+	searchRequest  int
 	searchQuery    string
 	rawSearchQuery string
 	showReasoning  bool
@@ -112,6 +174,9 @@ type Model struct {
 
 	width  int
 	height int
+
+	timelineRevision int
+	timelineCache    *timelineDisplayCache
 }
 
 var (
@@ -127,6 +192,8 @@ var (
 	warnStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
+var partTextFromRawJSONHook func()
+
 func NewModel(repo Repository, sessions []index.SessionSummary) Model {
 	sessions = topLevelSessions(sessions)
 	return Model{
@@ -138,6 +205,42 @@ func NewModel(repo Repository, sessions []index.SessionSummary) Model {
 		renderMarkdown:  true,
 		width:           100,
 		height:          28,
+		timelineCache:   newTimelineDisplayCache(),
+	}
+}
+
+func newTimelineDisplayCache() *timelineDisplayCache {
+	return &timelineDisplayCache{
+		textByPartID: map[string]string{},
+		markdownRows: map[markdownCacheKey][]string{},
+	}
+}
+
+func (m *Model) cancelPendingSearch() {
+	m.searchRequest++
+	m.searchLoading = false
+}
+
+func (m *Model) resetTimelineDisplayCache() {
+	m.timelineRevision++
+	m.timelineCache = newTimelineDisplayCache()
+	m.precomputeTimelineText()
+}
+
+func (m *Model) invalidateTimelineLayout() {
+	if m.timelineCache == nil {
+		m.timelineCache = newTimelineDisplayCache()
+		return
+	}
+	m.timelineCache.layout = nil
+}
+
+func (m *Model) precomputeTimelineText() {
+	if m.timelineCache == nil {
+		m.timelineCache = newTimelineDisplayCache()
+	}
+	for _, part := range m.timeline {
+		m.cachedDisplayText(part)
 	}
 }
 
@@ -150,6 +253,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = typed.Width
 		m.height = typed.Height
+		m.invalidateTimelineLayout()
 		m.normalizeSessionSelection()
 		m.timelineScroll = clamp(m.timelineScroll, 0, m.maxTimelineScroll())
 		if m.mode == ViewTimeline {
@@ -159,9 +263,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		if m.searchMode {
-			return m.updateSearch(typed), nil
+			return m.updateSearch(typed)
 		}
 		return m.updateKey(typed)
+	case sessionSearchResultMsg:
+		return m.applySessionSearchResult(typed), nil
+	case timelineSearchResultMsg:
+		return m.applyTimelineSearchResult(typed), nil
 	default:
 		return m, nil
 	}
@@ -207,12 +315,14 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		if m.mode == ViewTimeline {
 			m.showReasoning = !m.showReasoning
+			m.invalidateTimelineLayout()
 			m.normalizeTimelineFocus()
 		}
 		return m, nil
 	case "m":
 		if m.mode == ViewTimeline {
 			m.renderMarkdown = !m.renderMarkdown
+			m.invalidateTimelineLayout()
 			m.timelineScroll = clamp(m.timelineScroll, 0, m.maxTimelineScroll())
 			m.normalizeTimelineFocus()
 		}
@@ -228,12 +338,12 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m Model) updateSearch(msg tea.KeyMsg) Model {
+func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.searchMode = false
 		m.searchQuery = ""
-		return m
+		return m, nil
 	case "enter":
 		m.searchMode = false
 		return m.applySearch()
@@ -242,18 +352,19 @@ func (m Model) updateSearch(msg tea.KeyMsg) Model {
 			runes := []rune(m.searchQuery)
 			m.searchQuery = string(runes[:len(runes)-1])
 		}
-		return m
+		return m, nil
 	default:
 		if msg.Type == tea.KeyRunes {
 			m.searchQuery += string(msg.Runes)
 		}
-		return m
+		return m, nil
 	}
 }
 
-func (m Model) applySearch() Model {
+func (m Model) applySearch() (Model, tea.Cmd) {
 	query := strings.TrimSpace(m.searchQuery)
-	ctx := context.Background()
+	m.searchRequest++
+	requestID := m.searchRequest
 	switch m.mode {
 	case ViewSessions:
 		selectedID := m.selectedSessionID()
@@ -261,30 +372,69 @@ func (m Model) applySearch() Model {
 		if query == "" {
 			m.sessions = append([]index.SessionSummary(nil), m.allSessions...)
 			m.selectSessionByID(selectedID, fallback)
-		} else if sessions, err := m.repo.SearchSessions(ctx, query); err != nil {
-			m.lastErr = err
-		} else {
-			m.sessions = topLevelSessions(sessions)
-			m.selectSessionByID(selectedID, fallback)
 			m.lastErr = nil
+			m.searchLoading = false
+			return m, nil
+		}
+		m.searchLoading = true
+		return m, func() tea.Msg {
+			sessions, err := m.repo.SearchSessions(context.Background(), query)
+			return sessionSearchResultMsg{requestID: requestID, query: query, sessions: sessions, err: err}
 		}
 	case ViewTimeline:
 		if query == "" {
 			m.timeline = append([]index.TimelinePart(nil), m.allTimeline...)
-			m.timelineScroll = 0
-			m.selectedPart = m.firstFocusablePartInViewport()
-		} else if parts, err := m.repo.SearchSession(ctx, m.currentSession.ID, query); err != nil {
-			m.lastErr = err
-		} else {
-			m.timeline = parts
+			m.resetTimelineDisplayCache()
 			m.timelineScroll = 0
 			m.selectedPart = m.firstFocusablePartInViewport()
 			m.lastErr = nil
+			m.searchLoading = false
+			return m, nil
+		}
+		sessionID := m.currentSession.ID
+		m.searchLoading = true
+		return m, func() tea.Msg {
+			parts, err := m.repo.SearchSession(context.Background(), sessionID, query)
+			return timelineSearchResultMsg{requestID: requestID, sessionID: sessionID, query: query, parts: parts, err: err}
 		}
 	case ViewRawPart:
 		m.rawSearchQuery = query
 		m.rawScroll = 0
 	}
+	return m, nil
+}
+
+func (m Model) applySessionSearchResult(msg sessionSearchResultMsg) Model {
+	if msg.requestID != m.searchRequest || m.mode != ViewSessions {
+		return m
+	}
+	m.searchLoading = false
+	if msg.err != nil {
+		m.lastErr = msg.err
+		return m
+	}
+	selectedID := m.selectedSessionID()
+	fallback := m.selectedSession
+	m.sessions = topLevelSessions(msg.sessions)
+	m.selectSessionByID(selectedID, fallback)
+	m.lastErr = nil
+	return m
+}
+
+func (m Model) applyTimelineSearchResult(msg timelineSearchResultMsg) Model {
+	if msg.requestID != m.searchRequest || m.mode != ViewTimeline || msg.sessionID != m.currentSession.ID {
+		return m
+	}
+	m.searchLoading = false
+	if msg.err != nil {
+		m.lastErr = msg.err
+		return m
+	}
+	m.timeline = append([]index.TimelinePart(nil), msg.parts...)
+	m.resetTimelineDisplayCache()
+	m.timelineScroll = 0
+	m.selectedPart = m.firstFocusablePartInViewport()
+	m.lastErr = nil
 	return m
 }
 
@@ -346,6 +496,7 @@ func (m Model) openSelected() Model {
 			m.lastErr = err
 			return m
 		}
+		m.cancelPendingSearch()
 		m.currentSession = session
 		m.timeline = parts
 		m.allTimeline = append([]index.TimelinePart(nil), parts...)
@@ -353,6 +504,7 @@ func (m Model) openSelected() Model {
 		m.timelineScroll = 0
 		m.showReasoning = false
 		m.renderMarkdown = true
+		m.resetTimelineDisplayCache()
 		m.selectedPart = m.firstFocusablePartInViewport()
 		m.mode = ViewTimeline
 		return m
@@ -397,6 +549,7 @@ func (m Model) openLinkedSession(parentPartIndex int, parentPart index.TimelineP
 	if child.ParentID == "" {
 		child.ParentID = m.currentSession.ID
 	}
+	m.cancelPendingSearch()
 	m.timelineStack = append(m.timelineStack, timelineContext{
 		session:        m.currentSession,
 		timeline:       append([]index.TimelinePart(nil), m.timeline...),
@@ -412,6 +565,7 @@ func (m Model) openLinkedSession(parentPartIndex int, parentPart index.TimelineP
 	m.timelineScroll = 0
 	m.showReasoning = false
 	m.renderMarkdown = true
+	m.resetTimelineDisplayCache()
 	m.selectedPart = m.firstFocusablePartInViewport()
 	m.mode = ViewTimeline
 	m.lastErr = nil
@@ -424,6 +578,7 @@ func (m Model) openRawPart(partID string) Model {
 		m.lastErr = err
 		return m
 	}
+	m.cancelPendingSearch()
 	m.mode = ViewRawPart
 	m.rawPart = raw
 	m.rawContent = ""
@@ -459,6 +614,7 @@ func (m Model) openRawPart(partID string) Model {
 }
 
 func (m Model) back() Model {
+	m.cancelPendingSearch()
 	switch m.mode {
 	case ViewTimeline:
 		if len(m.timelineStack) > 0 {
@@ -471,6 +627,7 @@ func (m Model) back() Model {
 			m.timelineScroll = last.timelineScroll
 			m.showReasoning = last.showReasoning
 			m.renderMarkdown = last.renderMarkdown
+			m.resetTimelineDisplayCache()
 			m.mode = ViewTimeline
 			m.ensureFocusedPartVisible()
 			break
@@ -496,6 +653,9 @@ func (m Model) View() string {
 	}
 	if m.lastErr != nil {
 		sections = append(sections, warnStyle.Render(truncatePlain(m.lastErr.Error(), m.safeWidth())))
+	}
+	if m.searchLoading {
+		sections = append(sections, dimStyle.Render(truncatePlain("Searching...", m.safeWidth())))
 	}
 
 	height := m.height - len(sections) - 1
@@ -653,12 +813,11 @@ func (m Model) renderTimeline(height int) string {
 	width := m.safeWidth()
 	header := m.timelineHeader(width)
 	contentHeight := max(1, height-len(header))
-	rows := m.transcriptRows(width)
-	maxScroll := max(0, len(rows)-contentHeight)
+	layout := m.timelineLayout(width)
+	maxScroll := max(0, len(layout.rows)-contentHeight)
 	start := clamp(m.timelineScroll, 0, maxScroll)
-	window := rows[start:min(len(rows), start+contentHeight)]
 	lines := append([]string{}, header...)
-	for _, row := range window {
+	for _, row := range m.visibleTimelineRows(layout, start, min(len(layout.rows), start+contentHeight), width) {
 		lines = append(lines, row.text)
 	}
 	return fitBlock(lines, height, width)
@@ -699,14 +858,30 @@ func (m Model) nestedTimelineContext() string {
 }
 
 func (m Model) transcriptRows(width int) []transcriptLine {
-	if len(m.timeline) == 0 {
-		return []transcriptLine{{text: "No timeline parts.", partIndex: -1}}
+	layout := m.timelineLayout(width)
+	return m.visibleTimelineRows(layout, 0, len(layout.rows), width)
+}
+
+func (m Model) timelineLayout(width int) *timelineLayout {
+	if m.timelineCache == nil {
+		m.timelineCache = newTimelineDisplayCache()
 	}
-	var rows []transcriptLine
+	key := timelineLayoutKey{revision: m.timelineRevision, width: width, showReasoning: m.showReasoning, renderMarkdown: m.renderMarkdown}
+	if m.timelineCache.layout != nil && m.timelineCache.layoutKey == key {
+		return m.timelineCache.layout
+	}
+	layout := &timelineLayout{ranges: make([]timelineRowRange, len(m.timeline))}
+	if len(m.timeline) == 0 {
+		layout.rows = []timelineLayoutRow{{kind: timelineLayoutRowEmpty, partIndex: -1}}
+		m.timelineCache.layoutKey = key
+		m.timelineCache.layout = layout
+		return layout
+	}
 	currentMessage := ""
 	for i, part := range m.timeline {
-		partRows := m.partRows(part, i, width)
-		if len(partRows) == 0 {
+		count := m.partRowCount(part, i, width)
+		if count == 0 {
+			layout.ranges[i] = timelineRowRange{start: -1, end: -1}
 			continue
 		}
 		messageID := part.MessageID
@@ -714,18 +889,74 @@ func (m Model) transcriptRows(width int) []transcriptLine {
 			messageID = fmt.Sprintf("%s-%d", part.Role, i)
 		}
 		if messageID != currentMessage {
-			if len(rows) > 0 {
-				rows = append(rows, transcriptLine{text: "", partIndex: -1})
+			if len(layout.rows) > 0 {
+				layout.rows = append(layout.rows, timelineLayoutRow{kind: timelineLayoutRowSpacer, partIndex: -1})
 			}
-			rows = append(rows, roleHeader(part, width))
+			layout.rows = append(layout.rows, timelineLayoutRow{kind: timelineLayoutRowHeader, partIndex: i})
 			currentMessage = messageID
 		}
-		rows = append(rows, partRows...)
+		start := len(layout.rows)
+		rowPartIndex := i
+		if part.Kind == opencode.PartKindReasoning && !m.showReasoning {
+			rowPartIndex = -1
+		}
+		for row := 0; row < count; row++ {
+			layout.rows = append(layout.rows, timelineLayoutRow{kind: timelineLayoutRowPart, partIndex: rowPartIndex, rowIndex: row})
+		}
+		if rowPartIndex >= 0 {
+			layout.ranges[i] = timelineRowRange{start: start, end: len(layout.rows) - 1}
+		} else {
+			layout.ranges[i] = timelineRowRange{start: -1, end: -1}
+		}
 	}
-	if len(rows) == 0 {
-		return []transcriptLine{{text: "No visible timeline parts.", partIndex: -1}}
+	if len(layout.rows) == 0 {
+		layout.rows = []timelineLayoutRow{{kind: timelineLayoutRowEmpty, partIndex: -1}}
+	}
+	m.timelineCache.layoutKey = key
+	m.timelineCache.layout = layout
+	return layout
+}
+
+func (m Model) visibleTimelineRows(layout *timelineLayout, start, end, width int) []transcriptLine {
+	if start >= end {
+		return nil
+	}
+	partRows := make(map[int][]transcriptLine)
+	rows := make([]transcriptLine, 0, end-start)
+	for _, row := range layout.rows[start:end] {
+		switch row.kind {
+		case timelineLayoutRowEmpty:
+			if len(m.timeline) == 0 {
+				rows = append(rows, transcriptLine{text: "No timeline parts.", partIndex: -1})
+			} else {
+				rows = append(rows, transcriptLine{text: "No visible timeline parts.", partIndex: -1})
+			}
+		case timelineLayoutRowSpacer:
+			rows = append(rows, transcriptLine{text: "", partIndex: -1})
+		case timelineLayoutRowHeader:
+			if row.partIndex >= 0 && row.partIndex < len(m.timeline) {
+				rows = append(rows, roleHeader(m.timeline[row.partIndex], width))
+			}
+		case timelineLayoutRowPart:
+			if row.partIndex < 0 || row.partIndex >= len(m.timeline) {
+				rows = append(rows, transcriptLine{text: dimStyle.Render(truncatePlain("  [reasoning hidden] r to show", width)), partIndex: -1})
+				continue
+			}
+			rowsForPart, ok := partRows[row.partIndex]
+			if !ok {
+				rowsForPart = m.partRows(m.timeline[row.partIndex], row.partIndex, width)
+				partRows[row.partIndex] = rowsForPart
+			}
+			if row.rowIndex >= 0 && row.rowIndex < len(rowsForPart) {
+				rows = append(rows, rowsForPart[row.rowIndex])
+			}
+		}
 	}
 	return rows
+}
+
+func (m Model) partRowCount(part index.TimelinePart, partIndex, width int) int {
+	return len(m.partRows(part, partIndex, width))
 }
 
 func roleHeader(part index.TimelinePart, width int) transcriptLine {
@@ -739,16 +970,16 @@ func roleHeader(part index.TimelinePart, width int) transcriptLine {
 func (m Model) partRows(part index.TimelinePart, partIndex, width int) []transcriptLine {
 	switch part.Kind {
 	case opencode.PartKindText:
-		text := displayPartText(part)
+		text := m.cachedDisplayText(part)
 		if m.renderMarkdown && isAssistantRole(part.Role) {
-			return bodyMarkdownRows(text, width, partIndex, partIndex == m.selectedPart)
+			return m.bodyMarkdownRows(part, text, width, partIndex, partIndex == m.selectedPart)
 		}
 		return bodyTextRows(text, part.Role, width, partIndex, partIndex == m.selectedPart)
 	case opencode.PartKindReasoning:
 		if !m.showReasoning {
 			return []transcriptLine{{text: dimStyle.Render(truncatePlain("  [reasoning hidden] r to show", width)), partIndex: -1}}
 		}
-		return bodyTextRows(displayPartText(part), part.Role, width, partIndex, partIndex == m.selectedPart)
+		return bodyTextRows(m.cachedDisplayText(part), part.Role, width, partIndex, partIndex == m.selectedPart)
 	case opencode.PartKindTool, opencode.PartKindPatch, opencode.PartKindFile:
 		prefix := "  "
 		style := toolStyle
@@ -766,11 +997,11 @@ func (m Model) partRows(part index.TimelinePart, partIndex, width int) []transcr
 	}
 }
 
-func bodyMarkdownRows(text string, width int, partIndex int, focused bool) []transcriptLine {
+func (m Model) bodyMarkdownRows(part index.TimelinePart, text string, width int, partIndex int, focused bool) []transcriptLine {
 	if text == "" {
 		text = "[empty message]"
 	}
-	markdownRows := assistantMarkdownRows(text, max(12, width-2))
+	markdownRows := m.cachedMarkdownRows(part, text, max(12, width-2))
 	rows := make([]transcriptLine, 0, len(markdownRows))
 	for _, line := range markdownRows {
 		prefix := "  "
@@ -825,7 +1056,42 @@ func displayPartText(part index.TimelinePart) string {
 	return truncateRunes(text, maxTranscriptRunes)
 }
 
+func (m Model) cachedDisplayText(part index.TimelinePart) string {
+	if m.timelineCache == nil {
+		m.timelineCache = newTimelineDisplayCache()
+	}
+	key := firstNonEmpty(part.PartID, part.SourcePath, part.MessageID+":"+part.Type)
+	if key == "" {
+		return displayPartText(part)
+	}
+	if text, ok := m.timelineCache.textByPartID[key]; ok {
+		return text
+	}
+	text := displayPartText(part)
+	m.timelineCache.textByPartID[key] = text
+	return text
+}
+
+func (m Model) cachedMarkdownRows(part index.TimelinePart, text string, width int) []string {
+	if m.timelineCache == nil {
+		m.timelineCache = newTimelineDisplayCache()
+	}
+	key := markdownCacheKey{partID: firstNonEmpty(part.PartID, part.SourcePath), content: text, width: width}
+	if key.partID == "" {
+		return assistantMarkdownRows(text, width)
+	}
+	if rows, ok := m.timelineCache.markdownRows[key]; ok {
+		return rows
+	}
+	rows := assistantMarkdownRows(text, width)
+	m.timelineCache.markdownRows[key] = rows
+	return rows
+}
+
 func partTextFromRawJSON(raw string) string {
+	if partTextFromRawJSONHook != nil {
+		partTextFromRawJSONHook()
+	}
 	if raw == "" {
 		return ""
 	}
@@ -930,6 +1196,9 @@ func (m Model) bodyHeight() int {
 		reserved++
 	}
 	if m.lastErr != nil {
+		reserved++
+	}
+	if m.searchLoading {
 		reserved++
 	}
 	return max(1, m.height-reserved)
@@ -1300,7 +1569,8 @@ func (m Model) timelineHeaderHeight() int {
 }
 
 func (m Model) maxTimelineScroll() int {
-	return max(0, len(m.transcriptRows(m.safeWidth()))-m.timelineContentHeight())
+	layout := m.timelineLayout(m.safeWidth())
+	return max(0, len(layout.rows)-m.timelineContentHeight())
 }
 
 func (m Model) timelineScrollLabel() string {
@@ -1338,10 +1608,10 @@ func (m *Model) moveTimelineFocus(delta int) {
 		return
 	}
 
-	rows := m.transcriptRows(m.safeWidth())
-	start, end := focusedRowRange(rows, m.selectedPart)
+	layout := m.timelineLayout(m.safeWidth())
+	start, end := m.focusedRowRange(layout, m.selectedPart)
 	visible := m.timelineContentHeight()
-	m.timelineScroll = clamp(m.timelineScroll, 0, max(0, len(rows)-visible))
+	m.timelineScroll = clamp(m.timelineScroll, 0, max(0, len(layout.rows)-visible))
 	if start < 0 || end < 0 {
 		m.selectedPart = m.firstFocusablePartInViewport()
 		m.ensureFocusedPartVisible()
@@ -1382,8 +1652,8 @@ func (m *Model) ensureFocusedPartVisible() {
 	if m.selectedPart < 0 {
 		return
 	}
-	rows := m.transcriptRows(m.safeWidth())
-	start, end := focusedRowRange(rows, m.selectedPart)
+	layout := m.timelineLayout(m.safeWidth())
+	start, end := m.focusedRowRange(layout, m.selectedPart)
 	if start < 0 || end < 0 {
 		return
 	}
@@ -1401,27 +1671,20 @@ func (m *Model) ensureFocusedPartVisible() {
 	m.timelineScroll = clamp(m.timelineScroll, 0, m.maxTimelineScroll())
 }
 
-func focusedRowRange(rows []transcriptLine, partIndex int) (int, int) {
-	start := -1
-	end := -1
-	for i, row := range rows {
-		if row.partIndex != partIndex {
-			continue
-		}
-		if start < 0 {
-			start = i
-		}
-		end = i
+func (m Model) focusedRowRange(layout *timelineLayout, partIndex int) (int, int) {
+	if partIndex < 0 || partIndex >= len(layout.ranges) {
+		return -1, -1
 	}
-	return start, end
+	rangeForPart := layout.ranges[partIndex]
+	return rangeForPart.start, rangeForPart.end
 }
 
 func (m Model) firstFocusablePartInViewport() int {
-	rows := m.transcriptRows(m.safeWidth())
+	layout := m.timelineLayout(m.safeWidth())
 	visible := m.timelineContentHeight()
-	maxScroll := max(0, len(rows)-visible)
+	maxScroll := max(0, len(layout.rows)-visible)
 	start := clamp(m.timelineScroll, 0, maxScroll)
-	for _, row := range rows[start:min(len(rows), start+visible)] {
+	for _, row := range layout.rows[start:min(len(layout.rows), start+visible)] {
 		if row.partIndex >= 0 && row.partIndex < len(m.timeline) && m.isFocusablePart(m.timeline[row.partIndex]) {
 			return row.partIndex
 		}
@@ -1468,16 +1731,15 @@ func (m Model) partVisible(partIndex int) bool {
 	if partIndex < 0 {
 		return false
 	}
-	rows := m.transcriptRows(m.safeWidth())
+	layout := m.timelineLayout(m.safeWidth())
 	visible := m.timelineContentHeight()
-	maxScroll := max(0, len(rows)-visible)
+	maxScroll := max(0, len(layout.rows)-visible)
 	start := clamp(m.timelineScroll, 0, maxScroll)
-	for _, row := range rows[start:min(len(rows), start+visible)] {
-		if row.partIndex == partIndex {
-			return true
-		}
+	rangeStart, rangeEnd := m.focusedRowRange(layout, partIndex)
+	if rangeStart < 0 || rangeEnd < 0 {
+		return false
 	}
-	return false
+	return rangeEnd >= start && rangeStart < start+visible
 }
 
 func isOpenablePart(part index.TimelinePart) bool {

@@ -75,6 +75,68 @@ func TestModelContextSensitiveSearch(t *testing.T) {
 	}
 }
 
+func TestAsyncSessionSearchStartsCommandAndIgnoresStaleResult(t *testing.T) {
+	repo := newFakeRepo(t)
+	model := NewModel(repo, repo.sessions)
+	model, cmd1 := startSearchCommand(t, model, "project")
+	if cmd1 == nil || !model.searchLoading || repo.lastSessionSearch != "" {
+		t.Fatalf("session search should start loading without calling repository immediately: loading=%v last=%q cmdNil=%v", model.searchLoading, repo.lastSessionSearch, cmd1 == nil)
+	}
+	model = sendKey(t, model, "j")
+	if model.selectedSession != 1 {
+		t.Fatalf("input should remain responsive while search is loading, selected=%d", model.selectedSession)
+	}
+	model, cmd2 := startSearchCommand(t, model, "global")
+	if cmd2 == nil || !model.searchLoading {
+		t.Fatalf("second session search did not start loading")
+	}
+	stale := sessionSearchResultMsg{requestID: model.searchRequest - 1, query: "project", sessions: []index.SessionSummary{{ID: "stale", Title: "Stale"}}}
+	updated, _ := updateModel(t, model, stale)
+	model = updated
+	if len(model.sessions) == 1 && model.sessions[0].ID == "stale" {
+		t.Fatalf("stale session search result was applied")
+	}
+	if !model.searchLoading {
+		t.Fatalf("stale result should not clear loading for newer request")
+	}
+	model = runCmd(t, model, cmd2)
+	if repo.lastSessionSearch != "global" || len(model.sessions) != 1 || model.sessions[0].ID != "ses_global" || model.searchLoading {
+		t.Fatalf("latest session search not applied: last=%q sessions=%#v loading=%v", repo.lastSessionSearch, model.sessions, model.searchLoading)
+	}
+	_ = cmd1
+}
+
+func TestAsyncTimelineSearchIgnoresStaleAndViewChangedResults(t *testing.T) {
+	repo := newFakeRepo(t)
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	model, cmd1 := startSearchCommand(t, model, "README")
+	if cmd1 == nil || !model.searchLoading || repo.lastTimelineSearch != "" {
+		t.Fatalf("timeline search should start loading without immediate repository call")
+	}
+	model, cmd2 := startSearchCommand(t, model, "open docs")
+	stale := timelineSearchResultMsg{requestID: model.searchRequest - 1, sessionID: model.currentSession.ID, query: "README", parts: []index.TimelinePart{{PartID: "stale"}}}
+	updated, _ := updateModel(t, model, stale)
+	model = updated
+	if len(model.timeline) == 1 && model.timeline[0].PartID == "stale" {
+		t.Fatalf("stale timeline result was applied")
+	}
+	model = runCmd(t, model, cmd2)
+	if repo.lastTimelineSearch != "open docs" || len(model.timeline) != 1 || model.timeline[0].PartID != "prt_text" {
+		t.Fatalf("latest timeline search not applied: last=%q timeline=%#v", repo.lastTimelineSearch, model.timeline)
+	}
+
+	model, cmd3 := startSearchCommand(t, model, "README")
+	model = sendKey(t, model, "h")
+	result := cmd3().(timelineSearchResultMsg)
+	updated, _ = updateModel(t, model, result)
+	model = updated
+	if model.mode != ViewSessions || model.searchLoading {
+		t.Fatalf("view-changed timeline result should be ignored: mode=%v loading=%v", model.mode, model.searchLoading)
+	}
+	_ = cmd1
+}
+
 func TestSessionListModeTogglePreservesSelectedSession(t *testing.T) {
 	repo := newFakeRepo(t)
 	repo.sessions = sessionListModeTestSessions()
@@ -261,6 +323,70 @@ func TestModelRenderingIsBounded(t *testing.T) {
 	}
 	if strings.Contains(view, "visible item 9") {
 		t.Fatalf("render should be bounded to visible rows:\n%s", view)
+	}
+}
+
+func TestTimelineRepaintNavigationAndTogglesUseCachedRendering(t *testing.T) {
+	repo := newFakeRepo(t)
+	var parts []index.TimelinePart
+	for i := 0; i < 8; i++ {
+		text := fmt.Sprintf("# Item %02d\n\nUse `cached rendering` for part %02d.", i, i)
+		parts = append(parts, index.TimelinePart{
+			PartID:    fmt.Sprintf("prt_cache_%02d", i),
+			SessionID: "ses_project",
+			MessageID: fmt.Sprintf("msg_cache_%02d", i),
+			Role:      "assistant",
+			Kind:      opencode.PartKindText,
+			Preview:   text,
+			IndexText: text,
+			RawJSON:   fmt.Sprintf(`{"type":"text","text":%q}`, text),
+		})
+	}
+	repo.timelines["ses_project"] = parts
+
+	var rawDecodes int
+	var markdownRenders int
+	partTextFromRawJSONHook = func() { rawDecodes++ }
+	assistantMarkdownRowsHook = func() { markdownRenders++ }
+	t.Cleanup(func() {
+		partTextFromRawJSONHook = nil
+		assistantMarkdownRowsHook = nil
+	})
+
+	model := NewModel(repo, repo.sessions)
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 9})
+	model = sendKey(t, model, "l")
+	if rawDecodes != len(parts) {
+		t.Fatalf("raw text should be decoded once on load, got %d want %d", rawDecodes, len(parts))
+	}
+	_ = model.View()
+	initialMarkdownRenders := markdownRenders
+	if initialMarkdownRenders != len(parts) {
+		t.Fatalf("initial markdown render count = %d, want %d", initialMarkdownRenders, len(parts))
+	}
+	_ = model.View()
+	model = sendKey(t, model, "j")
+	_ = model.View()
+	if rawDecodes != len(parts) || markdownRenders != initialMarkdownRenders {
+		t.Fatalf("repaint/navigation rebuilt cached content: raw=%d markdown=%d", rawDecodes, markdownRenders)
+	}
+	model = sendKey(t, model, "r")
+	_ = model.View()
+	model = sendKey(t, model, "m")
+	_ = model.View()
+	model = sendKey(t, model, "m")
+	_ = model.View()
+	if rawDecodes != len(parts) || markdownRenders != initialMarkdownRenders {
+		t.Fatalf("reasoning/markdown toggles should reuse text and same-width markdown cache: raw=%d markdown=%d", rawDecodes, markdownRenders)
+	}
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 90, Height: 9})
+	_ = model.View()
+	if rawDecodes != len(parts) || markdownRenders != initialMarkdownRenders+len(parts) {
+		t.Fatalf("resize should reuse raw text and render markdown once for new width: raw=%d markdown=%d", rawDecodes, markdownRenders)
+	}
+	_ = model.View()
+	if markdownRenders != initialMarkdownRenders+len(parts) {
+		t.Fatalf("second repaint after resize rerendered markdown: %d", markdownRenders)
 	}
 }
 
@@ -704,7 +830,23 @@ func TestTimelineSearchUsesSourceMarkdownText(t *testing.T) {
 
 func sendKey(t *testing.T, model Model, key string) Model {
 	t.Helper()
-	updated, _ := updateModel(t, model, keyMsg(key))
+	updated, cmd := updateModel(t, model, keyMsg(key))
+	return runCmd(t, updated, cmd)
+}
+
+func runCmd(t *testing.T, model Model, cmd tea.Cmd) Model {
+	t.Helper()
+	if cmd == nil {
+		return model
+	}
+	msg := cmd()
+	if msg == nil {
+		return model
+	}
+	updated, next := updateModel(t, model, msg)
+	if next != nil {
+		return runCmd(t, updated, next)
+	}
 	return updated
 }
 
@@ -719,6 +861,15 @@ func search(t *testing.T, model Model, query string) Model {
 		model = sendKey(t, model, string(r))
 	}
 	return sendKey(t, model, "enter")
+}
+
+func startSearchCommand(t *testing.T, model Model, query string) (Model, tea.Cmd) {
+	t.Helper()
+	model = sendKey(t, model, "/")
+	for _, r := range query {
+		model = sendKey(t, model, string(r))
+	}
+	return updateModel(t, model, keyMsg("enter"))
 }
 
 func updateModel(t *testing.T, model Model, msg tea.Msg) (Model, tea.Cmd) {
