@@ -1,0 +1,14 @@
+{
+  "id": "prt_step_finish",
+  "sessionID": "ses_fixture",
+  "messageID": "msg_assistant",
+  "type": "step-finish",
+  "reason": "stop",
+  "tokens": {
+    "total": 42
+  },
+  "time": {
+    "start": 1770200007000,
+    "end": 1770200007001
+  }
+}

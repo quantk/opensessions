@@ -1,0 +1,22 @@
+{
+  "id": "prt_file",
+  "sessionID": "ses_fixture",
+  "messageID": "msg_assistant",
+  "type": "file",
+  "mime": "image/png",
+  "filename": "clipboard",
+  "url": "data:image/png;base64,iVBORw0KGgo=",
+  "source": {
+    "type": "file",
+    "path": "README.md",
+    "text": {
+      "value": "[Image 1]",
+      "start": 10,
+      "end": 19
+    }
+  },
+  "time": {
+    "start": 1770200004000,
+    "end": 1770200004001
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "id": "prt_text",
+  "sessionID": "ses_fixture",
+  "messageID": "msg_user",
+  "type": "text",
+  "text": "Please help me find sessions quickly",
+  "time": {
+    "start": 1770200001000,
+    "end": 1770200001001
+  }
+}

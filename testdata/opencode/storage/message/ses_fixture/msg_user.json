@@ -1,0 +1,15 @@
+{
+  "id": "msg_user",
+  "sessionID": "ses_fixture",
+  "role": "user",
+  "time": {
+    "created": 1770200001000
+  },
+  "summary": {
+    "title": "Find sessions request"
+  },
+  "model": {
+    "providerID": "openai",
+    "modelID": "gpt-test"
+  }
+}

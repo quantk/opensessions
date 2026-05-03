@@ -1,0 +1,16 @@
+{
+  "id": "msg_assistant",
+  "sessionID": "ses_fixture",
+  "role": "assistant",
+  "agent": "build",
+  "time": {
+    "created": 1770200002000
+  },
+  "summary": {
+    "title": "Implemented scanner"
+  },
+  "model": {
+    "providerID": "openai",
+    "modelID": "gpt-test"
+  }
+}

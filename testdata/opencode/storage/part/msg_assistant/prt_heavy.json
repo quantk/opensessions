@@ -1,0 +1,19 @@
+{
+  "id": "prt_heavy",
+  "sessionID": "ses_fixture",
+  "messageID": "msg_assistant",
+  "type": "tool",
+  "tool": "apply_patch",
+  "state": {
+    "status": "completed",
+    "title": "Apply binary patch",
+    "metadata": {
+      "before": "data:application/octet-stream;base64,AAECAwQFBgc=",
+      "diff": "Binary files differ"
+    }
+  },
+  "time": {
+    "start": 1770200005000,
+    "end": 1770200005001
+  }
+}

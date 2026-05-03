@@ -1,0 +1,20 @@
+{
+  "id": "prt_tool",
+  "sessionID": "ses_fixture",
+  "messageID": "msg_assistant",
+  "type": "tool",
+  "tool": "bash",
+  "state": {
+    "status": "completed",
+    "input": {
+      "command": "go test ./...",
+      "description": "List Go files",
+      "workdir": "/tmp/fixture-project"
+    },
+    "output": "ok github.com/quantick/opensession/internal/opencode"
+  },
+  "time": {
+    "start": 1770200003000,
+    "end": 1770200003001
+  }
+}

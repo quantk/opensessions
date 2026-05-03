@@ -1,0 +1,9 @@
+{
+  "id": "proj1",
+  "worktree": "/tmp/fixture-project",
+  "vcs": "git",
+  "time": {
+    "created": 1770200000000,
+    "updated": 1770201000000
+  }
+}

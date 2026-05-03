@@ -1,0 +1,11 @@
+{
+  "id": "prt_reasoning",
+  "sessionID": "ses_fixture",
+  "messageID": "msg_assistant",
+  "type": "reasoning",
+  "text": "planner note: inspect storage first",
+  "time": {
+    "start": 1770200002000,
+    "end": 1770200002001
+  }
+}

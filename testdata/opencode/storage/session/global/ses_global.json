@@ -1,0 +1,11 @@
+{
+  "id": "ses_global",
+  "slug": "global-fixture",
+  "projectID": "global",
+  "directory": "/tmp/global-work",
+  "title": "Global fixture session",
+  "time": {
+    "created": 1770200000000,
+    "updated": 1770200001000
+  }
+}

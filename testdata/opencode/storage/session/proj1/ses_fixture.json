@@ -1,0 +1,12 @@
+{
+  "id": "ses_fixture",
+  "slug": "fixture-session",
+  "version": "1.2.3",
+  "projectID": "proj1",
+  "directory": "/tmp/fixture-project",
+  "title": "Find sessions quickly",
+  "time": {
+    "created": 1770200000000,
+    "updated": 1770200200000
+  }
+}

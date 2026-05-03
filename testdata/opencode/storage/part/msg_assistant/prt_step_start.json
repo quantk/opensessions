@@ -1,0 +1,11 @@
+{
+  "id": "prt_step_start",
+  "sessionID": "ses_fixture",
+  "messageID": "msg_assistant",
+  "type": "step-start",
+  "snapshot": "abc123",
+  "time": {
+    "start": 1770200006000,
+    "end": 1770200006001
+  }
+}
