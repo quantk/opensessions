@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -135,7 +136,7 @@ func scanMessages(root string) ([]Message, error) {
 		if raw.SessionID == "" {
 			raw.SessionID = filepath.Base(filepath.Dir(path))
 		}
-		messages = append(messages, Message{
+		message := Message{
 			ID:            raw.ID,
 			SessionID:     raw.SessionID,
 			Role:          raw.Role,
@@ -146,7 +147,11 @@ func scanMessages(root string) ([]Message, error) {
 			CreatedAt:     unixMilli(raw.Time.Created),
 			UpdatedAt:     unixMilli(raw.Time.Updated),
 			Source:        fileRecord(path, info),
-		})
+		}
+		if strings.EqualFold(message.Role, "assistant") {
+			message.TokenUsage = parseRawTokenUsage(raw.Tokens)
+		}
+		messages = append(messages, message)
 		return nil
 	})
 	if err != nil {
@@ -212,6 +217,15 @@ func assembleSessions(projects []Project, sessions []Session, messages []Message
 			}
 			if session.ModelID == "" {
 				session.ModelID = message.ModelID
+			}
+			if message.TokenUsage.Available {
+				session.TokenUsage.Available = true
+				session.TokenUsage.Total += message.TokenUsage.Total
+				session.TokenUsage.Input += message.TokenUsage.Input
+				session.TokenUsage.Output += message.TokenUsage.Output
+				session.TokenUsage.Reasoning += message.TokenUsage.Reasoning
+				session.TokenUsage.CacheRead += message.TokenUsage.CacheRead
+				session.TokenUsage.CacheWrite += message.TokenUsage.CacheWrite
 			}
 			session.PartCount += len(message.Parts)
 			for _, part := range message.Parts {
@@ -403,6 +417,7 @@ type rawMessage struct {
 	Role      string `json:"role"`
 	Agent     string `json:"agent"`
 	Time      rawTime
+	Tokens    json.RawMessage `json:"tokens"`
 	Summary   struct {
 		Title string `json:"title"`
 	} `json:"summary"`
@@ -410,4 +425,92 @@ type rawMessage struct {
 		ProviderID string `json:"providerID"`
 		ModelID    string `json:"modelID"`
 	} `json:"model"`
+}
+
+func parseRawTokenUsage(raw json.RawMessage) TokenUsage {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return TokenUsage{}
+	}
+	var data map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&data); err != nil {
+		return TokenUsage{}
+	}
+	return parseTokenUsageMap(data)
+}
+
+func parseTokenUsageMap(data map[string]any) TokenUsage {
+	if data == nil {
+		return TokenUsage{}
+	}
+	var usage TokenUsage
+	var sawValue bool
+	totalSet := setTokenValue(&usage.Total, data, "total")
+	sawValue = sawValue || totalSet
+	sawValue = setTokenValue(&usage.Input, data, "input") || sawValue
+	sawValue = setTokenValue(&usage.Output, data, "output") || sawValue
+	sawValue = setTokenValue(&usage.Reasoning, data, "reasoning") || sawValue
+
+	cache := mapValue(data, "cache")
+	cacheReadSet := setTokenValue(&usage.CacheRead, cache, "read")
+	cacheWriteSet := setTokenValue(&usage.CacheWrite, cache, "write")
+	if !cacheReadSet {
+		cacheReadSet = setTokenValue(&usage.CacheRead, data, "cacheRead", "cache_read")
+	}
+	if !cacheWriteSet {
+		cacheWriteSet = setTokenValue(&usage.CacheWrite, data, "cacheWrite", "cache_write")
+	}
+	sawValue = cacheReadSet || cacheWriteSet || sawValue
+
+	if !sawValue {
+		return TokenUsage{}
+	}
+	usage.Available = true
+	if !totalSet {
+		usage.Total = usage.Input + usage.Output + usage.Reasoning + usage.CacheRead + usage.CacheWrite
+	}
+	return usage
+}
+
+func setTokenValue(target *int64, data map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		value, ok := data[key]
+		if !ok {
+			continue
+		}
+		parsed, ok := tokenInt(value)
+		if !ok {
+			continue
+		}
+		*target = parsed
+		return true
+	}
+	return false
+}
+
+func tokenInt(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return nonNegativeTokenInt(int64(typed))
+	case int64:
+		return nonNegativeTokenInt(typed)
+	case float64:
+		return nonNegativeTokenInt(int64(typed))
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return nonNegativeTokenInt(parsed)
+	default:
+		return 0, false
+	}
+}
+
+func nonNegativeTokenInt(value int64) (int64, bool) {
+	if value < 0 {
+		return 0, false
+	}
+	return value, true
 }

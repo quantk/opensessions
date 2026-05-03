@@ -31,6 +31,13 @@ func (s *Store) initSchema(ctx context.Context) error {
   message_count INTEGER NOT NULL DEFAULT 0,
   part_count INTEGER NOT NULL DEFAULT 0,
   heavy_part_count INTEGER NOT NULL DEFAULT 0,
+  token_usage_available INTEGER NOT NULL DEFAULT 0,
+  token_total INTEGER NOT NULL DEFAULT 0,
+  token_input INTEGER NOT NULL DEFAULT 0,
+  token_output INTEGER NOT NULL DEFAULT 0,
+  token_reasoning INTEGER NOT NULL DEFAULT 0,
+  token_cache_read INTEGER NOT NULL DEFAULT 0,
+  token_cache_write INTEGER NOT NULL DEFAULT 0,
   source_path TEXT
 )`,
 		`CREATE TABLE IF NOT EXISTS messages (
@@ -110,6 +117,22 @@ func (s *Store) initSchema(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "parts", "raw_json", "TEXT"); err != nil {
 		return err
+	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{"token_usage_available", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_total", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_input", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_output", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_reasoning", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_cache_read", "INTEGER NOT NULL DEFAULT 0"},
+		{"token_cache_write", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := s.ensureColumn(ctx, "sessions", column.name, column.definition); err != nil {
+			return err
+		}
 	}
 	return nil
 }

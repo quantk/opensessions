@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,6 +30,37 @@ const (
 	ViewRawPart
 )
 
+type SessionListMode int
+
+const (
+	SessionListFlat SessionListMode = iota
+	SessionListGrouped
+)
+
+type sessionListRowKind int
+
+const (
+	sessionListRowSession sessionListRowKind = iota
+	sessionListRowHeader
+)
+
+type sessionListRow struct {
+	kind         sessionListRowKind
+	session      index.SessionSummary
+	sessionIndex int
+	key          string
+	label        string
+	count        int
+	activeAt     time.Time
+}
+
+type sessionListGroup struct {
+	key      string
+	label    string
+	activeAt time.Time
+	rows     []sessionListRow
+}
+
 type Repository interface {
 	ListSessions(context.Context) ([]index.SessionSummary, error)
 	SearchSessions(context.Context, string) ([]index.SessionSummary, error)
@@ -41,6 +73,7 @@ type Model struct {
 	repo Repository
 
 	mode            ViewMode
+	sessionListMode SessionListMode
 	sessions        []index.SessionSummary
 	allSessions     []index.SessionSummary
 	timeline        []index.TimelinePart
@@ -56,6 +89,7 @@ type Model struct {
 	searchQuery    string
 	rawSearchQuery string
 	showReasoning  bool
+	renderMarkdown bool
 
 	rawPart    index.RawPart
 	rawContent string
@@ -83,12 +117,14 @@ var (
 
 func NewModel(repo Repository, sessions []index.SessionSummary) Model {
 	return Model{
-		repo:        repo,
-		mode:        ViewSessions,
-		sessions:    append([]index.SessionSummary(nil), sessions...),
-		allSessions: append([]index.SessionSummary(nil), sessions...),
-		width:       100,
-		height:      28,
+		repo:            repo,
+		mode:            ViewSessions,
+		sessionListMode: SessionListFlat,
+		sessions:        append([]index.SessionSummary(nil), sessions...),
+		allSessions:     append([]index.SessionSummary(nil), sessions...),
+		renderMarkdown:  true,
+		width:           100,
+		height:          28,
 	}
 }
 
@@ -101,7 +137,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = typed.Width
 		m.height = typed.Height
-		m.sessionScroll = clamp(m.sessionScroll, 0, max(0, len(m.sessions)-1))
+		m.normalizeSessionSelection()
 		m.timelineScroll = clamp(m.timelineScroll, 0, m.maxTimelineScroll())
 		if m.mode == ViewTimeline {
 			m.normalizeTimelineFocus()
@@ -144,6 +180,11 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "G", "end":
 		m.jump(true)
 		return m, nil
+	case "v":
+		if m.mode == ViewSessions {
+			m.toggleSessionListMode()
+		}
+		return m, nil
 	case "tab", "shift+tab":
 		return m, nil
 	case "l", "enter":
@@ -153,6 +194,13 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		if m.mode == ViewTimeline {
 			m.showReasoning = !m.showReasoning
+			m.normalizeTimelineFocus()
+		}
+		return m, nil
+	case "m":
+		if m.mode == ViewTimeline {
+			m.renderMarkdown = !m.renderMarkdown
+			m.timelineScroll = clamp(m.timelineScroll, 0, m.maxTimelineScroll())
 			m.normalizeTimelineFocus()
 		}
 		return m, nil
@@ -195,15 +243,16 @@ func (m Model) applySearch() Model {
 	ctx := context.Background()
 	switch m.mode {
 	case ViewSessions:
+		selectedID := m.selectedSessionID()
+		fallback := m.selectedSession
 		if query == "" {
 			m.sessions = append([]index.SessionSummary(nil), m.allSessions...)
-			m.selectedSession = clamp(m.selectedSession, 0, len(m.sessions)-1)
+			m.selectSessionByID(selectedID, fallback)
 		} else if sessions, err := m.repo.SearchSessions(ctx, query); err != nil {
 			m.lastErr = err
 		} else {
 			m.sessions = sessions
-			m.selectedSession = clamp(m.selectedSession, 0, len(m.sessions)-1)
-			m.sessionScroll = 0
+			m.selectSessionByID(selectedID, fallback)
 			m.lastErr = nil
 		}
 	case ViewTimeline:
@@ -229,8 +278,7 @@ func (m Model) applySearch() Model {
 func (m *Model) move(delta int) {
 	switch m.mode {
 	case ViewSessions:
-		m.selectedSession = clamp(m.selectedSession+delta, 0, len(m.sessions)-1)
-		m.sessionScroll = visibleStart(m.selectedSession, m.sessionListRows(), len(m.sessions))
+		m.moveSessionSelection(delta)
 	case ViewTimeline:
 		m.moveTimelineFocus(delta)
 	case ViewRawPart:
@@ -242,8 +290,7 @@ func (m *Model) page(delta int) {
 	amount := max(1, m.bodyHeight()-4)
 	switch m.mode {
 	case ViewSessions:
-		m.selectedSession = clamp(m.selectedSession+delta*amount, 0, len(m.sessions)-1)
-		m.sessionScroll = visibleStart(m.selectedSession, m.sessionListRows(), len(m.sessions))
+		m.pageSessionSelection(delta * amount)
 	case ViewTimeline:
 		m.timelineScroll = clamp(m.timelineScroll+delta*amount, 0, m.maxTimelineScroll())
 		m.selectedPart = m.firstFocusablePartInViewport()
@@ -255,12 +302,7 @@ func (m *Model) page(delta int) {
 func (m *Model) jump(bottom bool) {
 	switch m.mode {
 	case ViewSessions:
-		if bottom {
-			m.selectedSession = max(0, len(m.sessions)-1)
-		} else {
-			m.selectedSession = 0
-		}
-		m.sessionScroll = visibleStart(m.selectedSession, m.sessionListRows(), len(m.sessions))
+		m.jumpSessionSelection(bottom)
 	case ViewTimeline:
 		if bottom {
 			m.timelineScroll = m.maxTimelineScroll()
@@ -282,10 +324,10 @@ func (m *Model) jump(bottom bool) {
 func (m Model) openSelected() Model {
 	switch m.mode {
 	case ViewSessions:
-		if len(m.sessions) == 0 {
+		session, ok := m.selectedSessionSummary()
+		if !ok {
 			return m
 		}
-		session := m.sessions[m.selectedSession]
 		parts, err := m.repo.SessionTimeline(context.Background(), session.ID)
 		if err != nil {
 			m.lastErr = err
@@ -296,6 +338,7 @@ func (m Model) openSelected() Model {
 		m.allTimeline = append([]index.TimelinePart(nil), parts...)
 		m.timelineScroll = 0
 		m.showReasoning = false
+		m.renderMarkdown = true
 		m.selectedPart = m.firstFocusablePartInViewport()
 		m.mode = ViewTimeline
 		return m
@@ -402,7 +445,7 @@ func (m Model) renderHeader() string {
 	detail := ""
 	switch m.mode {
 	case ViewSessions:
-		detail = fmt.Sprintf("%d sessions", len(m.sessions))
+		detail = fmt.Sprintf("%d sessions - %s mode", len(m.sessions), m.sessionListModeLabel())
 	case ViewTimeline:
 		detail = firstNonEmpty(m.currentSession.Title, m.currentSession.ID)
 	case ViewRawPart:
@@ -428,9 +471,9 @@ func (m Model) renderFooter() string {
 	var help string
 	switch m.mode {
 	case ViewSessions:
-		help = "j/k move  l/Enter open  / search  q quit"
+		help = fmt.Sprintf("j/k move  l/Enter open  v %s view  / search  q quit", m.nextSessionListModeLabel())
 	case ViewTimeline:
-		help = "j/k move focus  l/Enter details  r reasoning  h back  / search  q quit"
+		help = fmt.Sprintf("j/k move focus  l/Enter details  r reasoning  %s  h back  / search  q quit", m.markdownToggleHelp())
 	case ViewRawPart:
 		toggle := "R raw JSON"
 		if m.rawMode {
@@ -476,19 +519,29 @@ func (m Model) renderSessionsWide(height, width int) string {
 }
 
 func (m Model) sessionListLines(height, width int) []string {
-	lines := []string{accentStyle.Render(padPlain(fmt.Sprintf("Sessions %d", len(m.sessions)), width))}
+	rows := m.sessionRows()
+	lines := []string{accentStyle.Render(padPlain(fmt.Sprintf("Sessions %d (%s)", len(m.sessions), m.sessionListModeLabel()), width))}
 	visible := max(1, height-1)
-	start := visibleStart(m.selectedSession, visible, len(m.sessions))
-	end := min(len(m.sessions), start+visible)
+	start, end := m.sessionListWindow(rows, visible)
+	selectedRow := m.selectedSessionRowIndex(rows)
 	for i := start; i < end; i++ {
-		session := m.sessions[i]
+		row := rows[i]
+		if row.kind == sessionListRowHeader {
+			lines = append(lines, m.sessionHeaderLine(row, width))
+			continue
+		}
+		session := row.session
 		title := firstNonEmpty(session.Title, session.ID)
 		if session.Bookmarked {
 			title = "* " + title
 		}
-		label := marker(i == m.selectedSession) + " " + title
+		prefix := " "
+		if m.sessionListMode == SessionListGrouped {
+			prefix = "  "
+		}
+		label := marker(i == selectedRow) + prefix + title
 		line := withTail(label, countLabel(session), width)
-		if i == m.selectedSession {
+		if i == selectedRow {
 			line = selectedStyle.Render(padPlain(line, width))
 		}
 		lines = append(lines, line)
@@ -497,10 +550,10 @@ func (m Model) sessionListLines(height, width int) []string {
 }
 
 func (m Model) sessionPreviewLines(height, width int) []string {
-	if len(m.sessions) == 0 {
+	selected, ok := m.selectedSessionSummary()
+	if !ok {
 		return []string{"No selection."}
 	}
-	selected := m.sessions[m.selectedSession]
 	lines := []string{accentStyle.Render("Session")}
 	lines = appendWrapped(lines, firstNonEmpty(selected.Title, selected.ID), width, titleStyle)
 	lines = append(lines,
@@ -509,6 +562,7 @@ func (m Model) sessionPreviewLines(height, width int) []string {
 		dimStyle.Render(truncatePlain("Updated: "+formatTime(selected.UpdatedAt), width)),
 	)
 	lines = append(lines, fmt.Sprintf("Messages: %d  Parts: %d  Heavy: %d", selected.MessageCount, selected.PartCount, selected.HeavyPartCount))
+	lines = append(lines, tokenUsagePreviewLines(selected.TokenUsage, width)...)
 	if len(selected.Tags) > 0 {
 		lines = append(lines, truncatePlain("Tags: "+strings.Join(selected.Tags, ", "), width))
 	}
@@ -523,9 +577,17 @@ func (m Model) sessionPreviewLines(height, width int) []string {
 
 func (m Model) renderTimeline(height int) string {
 	width := m.safeWidth()
+	metadata := []string{
+		"Project: " + groupName(m.currentSession),
+		"Model: " + firstNonEmpty(m.currentSession.ModelProvider, "unknown") + "/" + firstNonEmpty(m.currentSession.ModelID, "unknown"),
+	}
+	if usage := compactTokenUsage(m.currentSession.TokenUsage); usage != "" {
+		metadata = append(metadata, "Tokens: "+usage)
+	}
+	metadata = append(metadata, "Reasoning: "+onOff(m.showReasoning), "Scroll: "+m.timelineScrollLabel())
 	header := []string{
 		titleStyle.Render(truncatePlain(firstNonEmpty(m.currentSession.Title, m.currentSession.ID), width)),
-		dimStyle.Render(truncatePlain(fmt.Sprintf("Project: %s  Model: %s/%s  Reasoning: %s  Scroll: %s", groupName(m.currentSession), firstNonEmpty(m.currentSession.ModelProvider, "unknown"), firstNonEmpty(m.currentSession.ModelID, "unknown"), onOff(m.showReasoning), m.timelineScrollLabel()), width)),
+		dimStyle.Render(truncatePlain(strings.Join(metadata, "  "), width)),
 	}
 	contentHeight := max(1, height-len(header))
 	rows := m.transcriptRows(width)
@@ -580,7 +642,11 @@ func roleHeader(part index.TimelinePart, width int) transcriptLine {
 func (m Model) partRows(part index.TimelinePart, partIndex, width int) []transcriptLine {
 	switch part.Kind {
 	case opencode.PartKindText:
-		return bodyTextRows(displayPartText(part), part.Role, width, partIndex, partIndex == m.selectedPart)
+		text := displayPartText(part)
+		if m.renderMarkdown && isAssistantRole(part.Role) {
+			return bodyMarkdownRows(text, width, partIndex, partIndex == m.selectedPart)
+		}
+		return bodyTextRows(text, part.Role, width, partIndex, partIndex == m.selectedPart)
 	case opencode.PartKindReasoning:
 		if !m.showReasoning {
 			return []transcriptLine{{text: dimStyle.Render(truncatePlain("  [reasoning hidden] r to show", width)), partIndex: -1}}
@@ -601,6 +667,26 @@ func (m Model) partRows(part index.TimelinePart, partIndex, width int) []transcr
 		line := truncatePlain("  "+compactPart(part), width)
 		return []transcriptLine{{text: dimStyle.Render(line), partIndex: partIndex}}
 	}
+}
+
+func bodyMarkdownRows(text string, width int, partIndex int, focused bool) []transcriptLine {
+	if text == "" {
+		text = "[empty message]"
+	}
+	markdownRows := assistantMarkdownRows(text, max(12, width-2))
+	rows := make([]transcriptLine, 0, len(markdownRows))
+	for _, line := range markdownRows {
+		prefix := "  "
+		if focused {
+			prefix = "> "
+		}
+		rows = append(rows, transcriptLine{text: truncateStyled(prefix+line, width), partIndex: partIndex})
+	}
+	return rows
+}
+
+func isAssistantRole(role string) bool {
+	return strings.EqualFold(strings.TrimSpace(role), "assistant")
 }
 
 func bodyTextRows(text, role string, width int, partIndex int, focused bool) []transcriptLine {
@@ -753,6 +839,348 @@ func (m Model) safeWidth() int {
 
 func (m Model) sessionListRows() int {
 	return max(1, m.bodyHeight()-1)
+}
+
+func (m *Model) toggleSessionListMode() {
+	selectedID := m.selectedSessionID()
+	if m.sessionListMode == SessionListGrouped {
+		m.sessionListMode = SessionListFlat
+	} else {
+		m.sessionListMode = SessionListGrouped
+	}
+	m.selectSessionByID(selectedID, m.selectedSession)
+}
+
+func (m Model) sessionListModeLabel() string {
+	if m.sessionListMode == SessionListGrouped {
+		return "grouped"
+	}
+	return "flat"
+}
+
+func (m Model) nextSessionListModeLabel() string {
+	if m.sessionListMode == SessionListGrouped {
+		return "flat"
+	}
+	return "grouped"
+}
+
+func (m Model) markdownToggleHelp() string {
+	if m.renderMarkdown {
+		return "m source md"
+	}
+	return "m render md"
+}
+
+func (m Model) sessionRows() []sessionListRow {
+	if m.sessionListMode == SessionListGrouped {
+		return groupedSessionRows(m.sessions)
+	}
+	rows := make([]sessionListRow, 0, len(m.sessions))
+	for i, session := range m.sessions {
+		rows = append(rows, sessionListRow{kind: sessionListRowSession, session: session, sessionIndex: i})
+	}
+	return rows
+}
+
+func groupedSessionRows(sessions []index.SessionSummary) []sessionListRow {
+	groupsByKey := map[string]*sessionListGroup{}
+	for i, session := range sessions {
+		key := sessionGroupKey(session)
+		group := groupsByKey[key]
+		if group == nil {
+			group = &sessionListGroup{key: key, label: groupName(session)}
+			groupsByKey[key] = group
+		}
+		if session.UpdatedAt.After(group.activeAt) || group.activeAt.IsZero() {
+			group.activeAt = session.UpdatedAt
+		}
+		group.rows = append(group.rows, sessionListRow{kind: sessionListRowSession, session: session, sessionIndex: i})
+	}
+
+	groups := make([]sessionListGroup, 0, len(groupsByKey))
+	for _, group := range groupsByKey {
+		sort.SliceStable(group.rows, func(i, j int) bool {
+			left := group.rows[i]
+			right := group.rows[j]
+			if !left.session.UpdatedAt.Equal(right.session.UpdatedAt) {
+				return left.session.UpdatedAt.After(right.session.UpdatedAt)
+			}
+			if left.session.ID != right.session.ID {
+				return left.session.ID < right.session.ID
+			}
+			return left.sessionIndex < right.sessionIndex
+		})
+		groups = append(groups, *group)
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		if !groups[i].activeAt.Equal(groups[j].activeAt) {
+			return groups[i].activeAt.After(groups[j].activeAt)
+		}
+		if groups[i].label != groups[j].label {
+			return groups[i].label < groups[j].label
+		}
+		return groups[i].key < groups[j].key
+	})
+
+	rows := make([]sessionListRow, 0, len(sessions)+len(groups))
+	for _, group := range groups {
+		rows = append(rows, sessionListRow{kind: sessionListRowHeader, key: group.key, label: group.label, count: len(group.rows), activeAt: group.activeAt})
+		rows = append(rows, group.rows...)
+	}
+	return rows
+}
+
+func sessionGroupKey(session index.SessionSummary) string {
+	if session.ProjectID == "global" {
+		return "global"
+	}
+	return "project:" + firstNonEmpty(session.ProjectID, session.ProjectPath, session.Directory, "unknown")
+}
+
+func (m Model) sessionHeaderLine(row sessionListRow, width int) string {
+	count := fmt.Sprintf("%d sessions", row.count)
+	if row.count == 1 {
+		count = "1 session"
+	}
+	line := withTail("  "+row.label, count+"  active "+formatTime(row.activeAt), width)
+	return dimStyle.Render(padPlain(line, width))
+}
+
+func (m Model) sessionListWindow(rows []sessionListRow, visible int) (int, int) {
+	if len(rows) == 0 {
+		return 0, 0
+	}
+	visible = max(1, visible)
+	start := clamp(m.sessionScroll, 0, max(0, len(rows)-visible))
+	selectedRow := m.selectedSessionRowIndex(rows)
+	if selectedRow >= 0 {
+		if selectedRow < start {
+			start = selectedRow
+		}
+		if selectedRow >= start+visible {
+			start = selectedRow - visible + 1
+		}
+	}
+	start = clamp(start, 0, max(0, len(rows)-visible))
+	return start, min(len(rows), start+visible)
+}
+
+func (m Model) selectedSessionID() string {
+	if m.selectedSession < 0 || m.selectedSession >= len(m.sessions) {
+		return ""
+	}
+	return m.sessions[m.selectedSession].ID
+}
+
+func (m *Model) selectSessionByID(sessionID string, fallback int) {
+	if len(m.sessions) == 0 {
+		m.selectedSession = 0
+		m.sessionScroll = 0
+		return
+	}
+	if sessionID != "" {
+		for i, session := range m.sessions {
+			if session.ID == sessionID {
+				m.selectedSession = i
+				m.ensureSelectedSessionVisible()
+				return
+			}
+		}
+	}
+	m.selectedSession = clamp(fallback, 0, len(m.sessions)-1)
+	m.ensureSelectedSessionVisible()
+}
+
+func (m *Model) normalizeSessionSelection() {
+	if len(m.sessions) == 0 {
+		m.selectedSession = 0
+		m.sessionScroll = 0
+		return
+	}
+	m.selectedSession = clamp(m.selectedSession, 0, len(m.sessions)-1)
+	m.ensureSelectedSessionVisible()
+}
+
+func (m Model) selectedSessionSummary() (index.SessionSummary, bool) {
+	rows := m.sessionRows()
+	if row, ok := m.selectedSessionRow(rows); ok {
+		return row.session, true
+	}
+	if len(m.sessions) == 0 {
+		return index.SessionSummary{}, false
+	}
+	return m.sessions[clamp(m.selectedSession, 0, len(m.sessions)-1)], true
+}
+
+func (m Model) selectedSessionRow(rows []sessionListRow) (sessionListRow, bool) {
+	rowIndex := m.selectedSessionRowIndex(rows)
+	if rowIndex < 0 {
+		return sessionListRow{}, false
+	}
+	return rows[rowIndex], true
+}
+
+func (m Model) selectedSessionRowIndex(rows []sessionListRow) int {
+	if m.selectedSession < 0 || m.selectedSession >= len(m.sessions) {
+		return -1
+	}
+	for i, row := range rows {
+		if row.kind == sessionListRowSession && row.sessionIndex == m.selectedSession {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *Model) ensureSelectedSessionVisible() {
+	rows := m.sessionRows()
+	if len(rows) == 0 {
+		m.sessionScroll = 0
+		return
+	}
+	rowIndex := m.selectedSessionRowIndex(rows)
+	if rowIndex < 0 {
+		rowIndex = firstSelectableRowIndex(rows)
+		if rowIndex < 0 {
+			m.sessionScroll = 0
+			return
+		}
+		m.selectedSession = rows[rowIndex].sessionIndex
+	}
+	visible := m.sessionListRows()
+	if rowIndex < m.sessionScroll {
+		m.sessionScroll = rowIndex
+	}
+	if rowIndex >= m.sessionScroll+visible {
+		m.sessionScroll = rowIndex - visible + 1
+	}
+	m.sessionScroll = clamp(m.sessionScroll, 0, max(0, len(rows)-visible))
+}
+
+func (m *Model) moveSessionSelection(delta int) {
+	rows := m.sessionRows()
+	if len(rows) == 0 {
+		m.normalizeSessionSelection()
+		return
+	}
+	current := m.selectedSessionRowIndex(rows)
+	target := -1
+	if current < 0 {
+		if delta < 0 {
+			target = lastSelectableRowIndex(rows)
+		} else {
+			target = firstSelectableRowIndex(rows)
+		}
+	} else {
+		target = nextSelectableRowIndex(rows, current, delta)
+	}
+	if target >= 0 {
+		m.selectedSession = rows[target].sessionIndex
+	}
+	m.ensureSelectedSessionVisible()
+}
+
+func (m *Model) pageSessionSelection(delta int) {
+	rows := m.sessionRows()
+	if len(rows) == 0 {
+		m.normalizeSessionSelection()
+		return
+	}
+	current := m.selectedSessionRowIndex(rows)
+	target := -1
+	if current < 0 {
+		if delta < 0 {
+			target = lastSelectableRowIndex(rows)
+		} else {
+			target = firstSelectableRowIndex(rows)
+		}
+	} else {
+		target = selectableRowAtOrNear(rows, clamp(current+delta, 0, len(rows)-1), delta)
+	}
+	if target >= 0 {
+		m.selectedSession = rows[target].sessionIndex
+	}
+	m.ensureSelectedSessionVisible()
+}
+
+func (m *Model) jumpSessionSelection(bottom bool) {
+	rows := m.sessionRows()
+	target := firstSelectableRowIndex(rows)
+	if bottom {
+		target = lastSelectableRowIndex(rows)
+	}
+	if target >= 0 {
+		m.selectedSession = rows[target].sessionIndex
+	}
+	m.ensureSelectedSessionVisible()
+}
+
+func firstSelectableRowIndex(rows []sessionListRow) int {
+	for i, row := range rows {
+		if row.kind == sessionListRowSession {
+			return i
+		}
+	}
+	return -1
+}
+
+func lastSelectableRowIndex(rows []sessionListRow) int {
+	for i := len(rows) - 1; i >= 0; i-- {
+		if rows[i].kind == sessionListRowSession {
+			return i
+		}
+	}
+	return -1
+}
+
+func nextSelectableRowIndex(rows []sessionListRow, current, delta int) int {
+	if delta == 0 {
+		return -1
+	}
+	step := 1
+	if delta < 0 {
+		step = -1
+	}
+	for i := current + step; i >= 0 && i < len(rows); i += step {
+		if rows[i].kind == sessionListRowSession {
+			return i
+		}
+	}
+	return -1
+}
+
+func selectableRowAtOrNear(rows []sessionListRow, target, delta int) int {
+	if len(rows) == 0 {
+		return -1
+	}
+	if rows[target].kind == sessionListRowSession {
+		return target
+	}
+	if delta < 0 {
+		for i := target - 1; i >= 0; i-- {
+			if rows[i].kind == sessionListRowSession {
+				return i
+			}
+		}
+		for i := target + 1; i < len(rows); i++ {
+			if rows[i].kind == sessionListRowSession {
+				return i
+			}
+		}
+		return -1
+	}
+	for i := target + 1; i < len(rows); i++ {
+		if rows[i].kind == sessionListRowSession {
+			return i
+		}
+	}
+	for i := target - 1; i >= 0; i-- {
+		if rows[i].kind == sessionListRowSession {
+			return i
+		}
+	}
+	return -1
 }
 
 func (m Model) timelineContentHeight() int {
@@ -1143,10 +1571,10 @@ func padPlain(value string, width int) string {
 }
 
 func padStyled(value string, width int) string {
-	if lipgloss.Width(value) >= width {
-		return value
+	if styledWidth(value) >= width {
+		return truncateStyled(value, width)
 	}
-	return value + strings.Repeat(" ", width-lipgloss.Width(value))
+	return value + strings.Repeat(" ", width-styledWidth(value))
 }
 
 func truncatePlain(value string, width int) string {
@@ -1218,7 +1646,39 @@ func formatRawContent(content []byte) string {
 }
 
 func countLabel(session index.SessionSummary) string {
-	return fmt.Sprintf("%dm %dp", session.MessageCount, session.PartCount)
+	fields := []string{}
+	if usage := compactTokenUsage(session.TokenUsage); usage != "" {
+		fields = append(fields, usage)
+	}
+	fields = append(fields, fmt.Sprintf("%dm", session.MessageCount), fmt.Sprintf("%dp", session.PartCount))
+	return strings.Join(fields, " ")
+}
+
+func compactTokenUsage(usage opencode.TokenUsage) string {
+	if !usage.Available {
+		return ""
+	}
+	return formatTokenCount(usage.Total) + " tok"
+}
+
+func tokenUsagePreviewLines(usage opencode.TokenUsage, width int) []string {
+	if !usage.Available {
+		return []string{dimStyle.Render(truncatePlain("Tokens: unavailable", width))}
+	}
+	return []string{
+		truncatePlain(fmt.Sprintf("Tokens: total %s  input %s  output %s", formatTokenCount(usage.Total), formatTokenCount(usage.Input), formatTokenCount(usage.Output)), width),
+		truncatePlain(fmt.Sprintf("        reasoning %s  cache read %s  cache write %s", formatTokenCount(usage.Reasoning), formatTokenCount(usage.CacheRead), formatTokenCount(usage.CacheWrite)), width),
+	}
+}
+
+func formatTokenCount(value int64) string {
+	if value >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(value)/1_000_000)
+	}
+	if value >= 1_000 {
+		return fmt.Sprintf("%.1fk", float64(value)/1_000)
+	}
+	return fmt.Sprintf("%d", value)
 }
 
 func shortPath(value string) string {

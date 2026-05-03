@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -137,6 +138,9 @@ func scanDatabaseMessages(ctx context.Context, db *sql.DB, dbPath string, info f
 			CreatedAt:     firstTime(unixMilli(created), unixMilli(timeValue(data, "created"))),
 			UpdatedAt:     firstTime(unixMilli(updated), unixMilli(timeValue(data, "updated"))),
 			Source:        FileRecord{Path: dbSourcePath(dbPath, "message", id), SizeBytes: info.Size(), ModTime: info.ModTime()},
+		}
+		if strings.EqualFold(message.Role, "assistant") {
+			message.TokenUsage = parseTokenUsageMap(mapValue(data, "tokens"))
 		}
 		messages = append(messages, message)
 	}

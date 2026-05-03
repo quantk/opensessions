@@ -56,6 +56,9 @@ func TestScanAssemblesSessionsAndClassifiesParts(t *testing.T) {
 	if session.MessageCount != 2 || session.PartCount != 7 || session.HeavyPartCount != 1 {
 		t.Fatalf("counts = messages:%d parts:%d heavy:%d", session.MessageCount, session.PartCount, session.HeavyPartCount)
 	}
+	if !session.TokenUsage.Available || session.TokenUsage.Total != 321 || session.TokenUsage.Input != 100 || session.TokenUsage.Output != 70 || session.TokenUsage.Reasoning != 20 || session.TokenUsage.CacheRead != 30 || session.TokenUsage.CacheWrite != 10 {
+		t.Fatalf("token usage = %#v", session.TokenUsage)
+	}
 	if session.ModelProvider != "openai" || session.ModelID != "gpt-test" {
 		t.Fatalf("model = %q/%q", session.ModelProvider, session.ModelID)
 	}
@@ -65,6 +68,14 @@ func TestScanAssemblesSessionsAndClassifiesParts(t *testing.T) {
 	}
 	if session.Messages[0].ID != "msg_user" || session.Messages[1].ID != "msg_assistant" {
 		t.Fatalf("messages not chronological: %#v", []string{session.Messages[0].ID, session.Messages[1].ID})
+	}
+	if session.Messages[0].TokenUsage.Available || !session.Messages[1].TokenUsage.Available {
+		t.Fatalf("message token availability = %#v / %#v", session.Messages[0].TokenUsage, session.Messages[1].TokenUsage)
+	}
+
+	global := findSession(t, snapshot, "ses_global")
+	if global.TokenUsage.Available || global.TokenUsage.Total != 0 {
+		t.Fatalf("global token usage = %#v, want unavailable", global.TokenUsage)
 	}
 
 	text := findPart(t, session, "prt_text")
@@ -121,6 +132,7 @@ func TestScanIncludesSQLiteDatabaseSessions(t *testing.T) {
 	mustExec(t, db, `INSERT INTO project (id, worktree, vcs, time_created, time_updated) VALUES ('proj-db', '/tmp/db-project', 'git', 1777800000000, 1777800000000)`)
 	mustExec(t, db, `INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('ses_db', 'proj-db', 'fresh', '/tmp/db-project', 'Fresh database session', '1.2.3', 1777800000000, 1777800100000)`)
 	mustExec(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_db_user', 'ses_db', 1777800001000, 1777800001000, '{"role":"user","agent":"build","model":{"providerID":"openai","modelID":"gpt-5.5"},"summary":{"title":"Fresh question"}}')`)
+	mustExec(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_db_assistant', 'ses_db', 1777800002000, 1777800002000, '{"role":"assistant","agent":"build","model":{"providerID":"openai","modelID":"gpt-5.5"},"tokens":{"input":100,"output":25,"reasoning":5,"cache":{"read":10,"write":3}},"cost":9.99}')`)
 	mustExec(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_db_text', 'msg_db_user', 'ses_db', 1777800001000, 1777800001000, '{"type":"text","text":"fresh transcript from sqlite"}')`)
 
 	snapshot, err := Scan(root)
@@ -131,8 +143,11 @@ func TestScanIncludesSQLiteDatabaseSessions(t *testing.T) {
 	if session.Title != "Fresh database session" || session.ProjectPath != "/tmp/db-project" {
 		t.Fatalf("database session = %#v", session)
 	}
-	if session.MessageCount != 1 || session.PartCount != 1 {
+	if session.MessageCount != 2 || session.PartCount != 1 {
 		t.Fatalf("database counts = messages:%d parts:%d", session.MessageCount, session.PartCount)
+	}
+	if !session.TokenUsage.Available || session.TokenUsage.Total != 143 || session.TokenUsage.Input != 100 || session.TokenUsage.Output != 25 || session.TokenUsage.Reasoning != 5 || session.TokenUsage.CacheRead != 10 || session.TokenUsage.CacheWrite != 3 {
+		t.Fatalf("database token usage = %#v", session.TokenUsage)
 	}
 	part := findPart(t, session, "prt_db_text")
 	if !strings.Contains(part.IndexText, "fresh transcript") || !strings.Contains(part.RawJSON, "fresh transcript") {

@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	termansi "github.com/charmbracelet/x/ansi"
 	"github.com/quantick/opensession/internal/index"
 	"github.com/quantick/opensession/internal/opencode"
 )
@@ -69,6 +72,133 @@ func TestModelContextSensitiveSearch(t *testing.T) {
 	}
 	if len(model.timeline) != 1 || model.timeline[0].PartID != "prt_file" {
 		t.Fatalf("filtered timeline = %#v", model.timeline)
+	}
+}
+
+func TestSessionListModeTogglePreservesSelectedSession(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions = sessionListModeTestSessions()
+	model := NewModel(repo, repo.sessions)
+	model.selectedSession = 3
+	selectedID := model.selectedSessionID()
+
+	model = sendKey(t, model, "v")
+	if model.sessionListMode != SessionListGrouped {
+		t.Fatalf("session list mode = %v, want grouped", model.sessionListMode)
+	}
+	if model.selectedSessionID() != selectedID {
+		t.Fatalf("selected session after grouped toggle = %q, want %q", model.selectedSessionID(), selectedID)
+	}
+	if row, ok := model.selectedSessionRow(model.sessionRows()); !ok || row.session.ID != selectedID {
+		t.Fatalf("selected grouped row = %#v, ok = %v, want session %q", row, ok, selectedID)
+	}
+
+	model = sendKey(t, model, "v")
+	if model.sessionListMode != SessionListFlat {
+		t.Fatalf("session list mode = %v, want flat", model.sessionListMode)
+	}
+	if model.selectedSessionID() != selectedID {
+		t.Fatalf("selected session after flat toggle = %q, want %q", model.selectedSessionID(), selectedID)
+	}
+}
+
+func TestGroupedSessionRowsOrderByVisibleActivity(t *testing.T) {
+	rows := groupedSessionRows(sessionListModeTestSessions())
+	wantHeaders := []string{"/tmp/beta", "Global sessions", "/tmp/alpha"}
+	if got := sessionHeaderLabels(rows); !reflect.DeepEqual(got, wantHeaders) {
+		t.Fatalf("header labels = %#v, want %#v", got, wantHeaders)
+	}
+
+	wantAlphaSessions := []string{"alpha-recent", "alpha-match-old"}
+	if got := groupSessionIDs(rows, "/tmp/alpha"); !reflect.DeepEqual(got, wantAlphaSessions) {
+		t.Fatalf("alpha sessions = %#v, want %#v", got, wantAlphaSessions)
+	}
+}
+
+func TestGroupedSearchResultsStayGroupedByMatchingActivity(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions = sessionListModeTestSessions()
+	model := NewModel(repo, repo.sessions)
+	model.selectedSession = 1
+	selectedID := model.selectedSessionID()
+	model = sendKey(t, model, "v")
+	model = search(t, model, "match")
+
+	if model.sessionListMode != SessionListGrouped {
+		t.Fatalf("session list mode = %v, want grouped", model.sessionListMode)
+	}
+	if model.selectedSessionID() != selectedID {
+		t.Fatalf("selected session after grouped search = %q, want %q", model.selectedSessionID(), selectedID)
+	}
+	wantHeaders := []string{"/tmp/beta", "Global sessions", "/tmp/alpha"}
+	if got := sessionHeaderLabels(model.sessionRows()); !reflect.DeepEqual(got, wantHeaders) {
+		t.Fatalf("search header labels = %#v, want %#v", got, wantHeaders)
+	}
+	if got := groupSessionIDs(model.sessionRows(), "/tmp/alpha"); !reflect.DeepEqual(got, []string{"alpha-match-old"}) {
+		t.Fatalf("alpha search sessions = %#v, want only matching alpha session", got)
+	}
+	if strings.Contains(model.View(), "Alpha Recent") {
+		t.Fatalf("grouped search should not render unmatched sessions:\n%s", model.View())
+	}
+
+	model = search(t, model, "")
+	if model.selectedSessionID() != selectedID {
+		t.Fatalf("selected session after clearing search = %q, want %q", model.selectedSessionID(), selectedID)
+	}
+}
+
+func TestGroupedSessionNavigationSkipsHeadersAndKeepsSelectionVisible(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions = sessionListModeTestSessions()
+	model := NewModel(repo, repo.sessions)
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 5})
+	model = sendKey(t, model, "v")
+
+	if model.selectedSessionID() != "beta-match" {
+		t.Fatalf("initial selected session = %q, want beta-match", model.selectedSessionID())
+	}
+	model = sendKey(t, model, "j")
+	if model.selectedSessionID() != "global-match" {
+		t.Fatalf("selected session after j = %q, want global-match", model.selectedSessionID())
+	}
+	requireSelectedSessionVisible(t, model)
+
+	model = sendKey(t, model, "j")
+	if model.selectedSessionID() != "alpha-recent" {
+		t.Fatalf("selected session after second j = %q, want alpha-recent", model.selectedSessionID())
+	}
+	requireSelectedSessionVisible(t, model)
+}
+
+func TestModelRendersSessionTokenUsage(t *testing.T) {
+	repo := newFakeRepo(t)
+	model := NewModel(repo, repo.sessions)
+
+	view := model.View()
+	if !strings.Contains(view, "321 tok") || !strings.Contains(view, "Tokens: total 321") || !strings.Contains(view, "cache read 30") || !strings.Contains(view, "cache write 10") {
+		t.Fatalf("session token usage missing from list/preview:\n%s", view)
+	}
+	if strings.Contains(strings.ToLower(view), "cost") {
+		t.Fatalf("cost should not render with token usage:\n%s", view)
+	}
+
+	model = sendKey(t, model, "l")
+	view = model.View()
+	if !strings.Contains(view, "Tokens: 321 tok") {
+		t.Fatalf("session token usage missing from detail header:\n%s", view)
+	}
+	if strings.Contains(strings.ToLower(view), "cost") {
+		t.Fatalf("cost should not render in detail header:\n%s", view)
+	}
+
+	model = sendKey(t, model, "h")
+	model = sendKey(t, model, "j")
+	view = model.View()
+	if !strings.Contains(view, "Tokens: unavailable") {
+		t.Fatalf("unavailable token usage missing from preview:\n%s", view)
+	}
+	if strings.Contains(view, "0 tok") {
+		t.Fatalf("unavailable token usage should not render zero total:\n%s", view)
 	}
 }
 
@@ -322,10 +452,145 @@ func TestTimelinePreservesMessageLineBreaks(t *testing.T) {
 	}
 }
 
+func TestAssistantMarkdownRendersByDefaultAndTogglesSource(t *testing.T) {
+	repo := newFakeRepo(t)
+	markdown := "# Plan\n\nUse `go test ./internal/tui`.\n\n- Keep it small"
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_markdown", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindText, Preview: markdown, IndexText: markdown, RawJSON: fmt.Sprintf(`{"type":"text","text":%q}`, markdown)},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	view := model.View()
+	plain := plainView(view)
+	if !model.renderMarkdown || !strings.Contains(view, "m source md") {
+		t.Fatalf("assistant markdown should render by default with source toggle:\n%s", view)
+	}
+	if strings.Contains(plain, "`go test ./internal/tui`") || !strings.Contains(plain, "go test ./internal/tui") {
+		t.Fatalf("assistant markdown did not render inline code by default:\n%s", view)
+	}
+
+	model = sendKey(t, model, "m")
+	view = model.View()
+	plain = plainView(view)
+	if model.renderMarkdown || !strings.Contains(view, "m render md") {
+		t.Fatalf("assistant markdown source toggle missing:\n%s", view)
+	}
+	if !strings.Contains(plain, "`go test ./internal/tui`") {
+		t.Fatalf("assistant markdown source was not shown after toggle:\n%s", view)
+	}
+}
+
+func TestUserMarkdownSyntaxStaysSourceText(t *testing.T) {
+	repo := newFakeRepo(t)
+	markdown := "Use `go test` and **keep source markers**."
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_user_md", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Preview: markdown, IndexText: markdown, RawJSON: fmt.Sprintf(`{"type":"text","text":%q}`, markdown)},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	plain := plainView(model.View())
+	if !strings.Contains(plain, "`go test`") || !strings.Contains(plain, "**keep source markers**") {
+		t.Fatalf("user markdown should remain source text:\n%s", model.View())
+	}
+}
+
+func TestAssistantMarkdownCodeBlocksInlineCodeAndUnknownFence(t *testing.T) {
+	source := "Inline `value`.\n\n```go\nfmt.Println(\"hi\")\n```\n\n```definitelyunknown\nplain fallback\n```"
+	rows := assistantMarkdownRows(source, 80)
+	rendered := strings.Join(rows, "\n")
+	plain := plainView(rendered)
+
+	if strings.Contains(plain, "```") || strings.Contains(plain, "`value`") {
+		t.Fatalf("assistant markdown should render code markers away:\n%s", rendered)
+	}
+	if !strings.Contains(plain, "fmt.Println") || !strings.Contains(plain, "plain fallback") || !strings.Contains(plain, "value") {
+		t.Fatalf("assistant markdown code content missing:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "\x1b[") {
+		t.Fatalf("assistant markdown code should include ANSI styling:\n%s", rendered)
+	}
+}
+
+func TestAssistantMarkdownCodeFenceTimelineDoesNotPanic(t *testing.T) {
+	repo := newFakeRepo(t)
+	markdown := "```go\n// comment\nfmt.Println(\"hi\")\n```"
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_code", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindText, Preview: markdown, IndexText: markdown, RawJSON: fmt.Sprintf(`{"type":"text","text":%q}`, markdown)},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	view := model.View()
+	plain := plainView(view)
+	if !strings.Contains(plain, "fmt.Println") || !strings.Contains(plain, "comment") {
+		t.Fatalf("assistant code fence content missing from timeline:\n%s", view)
+	}
+}
+
+func TestAssistantMarkdownLongScrollingAndBoundedRendering(t *testing.T) {
+	repo := newFakeRepo(t)
+	var lines []string
+	for i := 0; i < 30; i++ {
+		lines = append(lines, fmt.Sprintf("- long item %02d", i))
+	}
+	markdown := strings.Join(lines, "\n")
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_long_md", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindText, Preview: markdown, IndexText: markdown, RawJSON: fmt.Sprintf(`{"type":"text","text":%q}`, markdown)},
+		{PartID: "prt_after", SessionID: "ses_project", MessageID: "msg_after", Role: "assistant", Kind: opencode.PartKindText, Preview: "after long", IndexText: "after long"},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 9})
+	model = sendKey(t, model, "l")
+	if strings.Contains(plainView(model.View()), "long item 20") {
+		t.Fatalf("long assistant markdown render should be bounded:\n%s", model.View())
+	}
+	for i := 0; i < 8; i++ {
+		model = sendKey(t, model, "j")
+	}
+	if model.selectedPart != 0 {
+		t.Fatalf("focus moved away from long assistant markdown too early: selected=%d", model.selectedPart)
+	}
+	if model.timelineScroll < 8 {
+		t.Fatalf("j did not keep scrolling inside long assistant markdown: scroll=%d", model.timelineScroll)
+	}
+	plain := plainView(model.View())
+	if strings.Contains(plain, "long item 00") || !strings.Contains(plain, "long item 08") {
+		t.Fatalf("long assistant markdown viewport did not advance:\n%s", model.View())
+	}
+}
+
+func TestTimelineSearchUsesSourceMarkdownText(t *testing.T) {
+	repo := newFakeRepo(t)
+	markdown := "Use `needle` in rendered assistant markdown."
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_source_match", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindText, Preview: markdown, IndexText: markdown, RawJSON: fmt.Sprintf(`{"type":"text","text":%q}`, markdown)},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	if strings.Contains(plainView(model.View()), "`needle`") {
+		t.Fatalf("precondition failed: rendered markdown should hide source backticks:\n%s", model.View())
+	}
+	model = search(t, model, "`needle`")
+	if repo.lastTimelineSearch != "`needle`" {
+		t.Fatalf("timeline search query = %q", repo.lastTimelineSearch)
+	}
+	if len(model.timeline) != 1 || model.timeline[0].PartID != "prt_source_match" {
+		t.Fatalf("timeline search should match source/index markdown text, got %#v", model.timeline)
+	}
+}
+
 func sendKey(t *testing.T, model Model, key string) Model {
 	t.Helper()
 	updated, _ := updateModel(t, model, keyMsg(key))
 	return updated
+}
+
+func plainView(view string) string {
+	return termansi.Strip(view)
 }
 
 func search(t *testing.T, model Model, query string) Model {
@@ -362,6 +627,56 @@ func keyMsg(key string) tea.KeyMsg {
 	}
 }
 
+func sessionListModeTestSessions() []index.SessionSummary {
+	base := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	return []index.SessionSummary{
+		{ID: "beta-match", ProjectID: "beta", ProjectPath: "/tmp/beta", Title: "Beta Match", UpdatedAt: base.Add(4 * time.Hour)},
+		{ID: "global-match", ProjectID: "global", ProjectPath: "Global", Title: "Global Match", UpdatedAt: base.Add(2 * time.Hour)},
+		{ID: "alpha-recent", ProjectID: "alpha", ProjectPath: "/tmp/alpha", Title: "Alpha Recent", UpdatedAt: base.Add(time.Hour)},
+		{ID: "alpha-match-old", ProjectID: "alpha", ProjectPath: "/tmp/alpha", Title: "Alpha Match Old", UpdatedAt: base},
+	}
+}
+
+func sessionHeaderLabels(rows []sessionListRow) []string {
+	var labels []string
+	for _, row := range rows {
+		if row.kind == sessionListRowHeader {
+			labels = append(labels, row.label)
+		}
+	}
+	return labels
+}
+
+func groupSessionIDs(rows []sessionListRow, label string) []string {
+	var ids []string
+	inGroup := false
+	for _, row := range rows {
+		if row.kind == sessionListRowHeader {
+			if inGroup {
+				break
+			}
+			inGroup = row.label == label
+			continue
+		}
+		if inGroup {
+			ids = append(ids, row.session.ID)
+		}
+	}
+	return ids
+}
+
+func requireSelectedSessionVisible(t *testing.T, model Model) {
+	t.Helper()
+	selected, ok := model.selectedSessionSummary()
+	if !ok {
+		t.Fatal("selected session missing")
+	}
+	title := firstNonEmpty(selected.Title, selected.ID)
+	if !strings.Contains(model.View(), title) {
+		t.Fatalf("selected session %q is not visible:\n%s", title, model.View())
+	}
+}
+
 type fakeRepo struct {
 	sessions           []index.SessionSummary
 	timelines          map[string][]index.TimelinePart
@@ -376,7 +691,7 @@ func newFakeRepo(t *testing.T) *fakeRepo {
 	heavyPath := filepath.Join(t.TempDir(), "heavy.json")
 	return &fakeRepo{
 		sessions: []index.SessionSummary{
-			{ID: "ses_project", ProjectID: "proj", ProjectPath: "/tmp/project", Title: "Project session", MessageCount: 2, PartCount: 3, HeavyPartCount: 1},
+			{ID: "ses_project", ProjectID: "proj", ProjectPath: "/tmp/project", Title: "Project session", MessageCount: 2, PartCount: 3, HeavyPartCount: 1, TokenUsage: opencode.TokenUsage{Available: true, Total: 321, Input: 100, Output: 70, Reasoning: 20, CacheRead: 30, CacheWrite: 10}},
 			{ID: "ses_global", ProjectID: "global", ProjectPath: "Global", Title: "Global session"},
 		},
 		timelines: map[string][]index.TimelinePart{

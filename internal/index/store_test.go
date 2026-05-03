@@ -58,6 +58,13 @@ func TestStoreUpsertsSearchTagsBookmarksAndScanMetadata(t *testing.T) {
 	if fixture.MessageCount != 2 || fixture.PartCount != 7 || fixture.HeavyPartCount != 1 {
 		t.Fatalf("counts = messages:%d parts:%d heavy:%d", fixture.MessageCount, fixture.PartCount, fixture.HeavyPartCount)
 	}
+	if !fixture.TokenUsage.Available || fixture.TokenUsage.Total != 321 || fixture.TokenUsage.Input != 100 || fixture.TokenUsage.Output != 70 || fixture.TokenUsage.Reasoning != 20 || fixture.TokenUsage.CacheRead != 30 || fixture.TokenUsage.CacheWrite != 10 {
+		t.Fatalf("token usage = %#v", fixture.TokenUsage)
+	}
+	global := findSessionSummary(t, sessions, "ses_global")
+	if global.TokenUsage.Available || global.TokenUsage.Total != 0 {
+		t.Fatalf("global token usage = %#v, want unavailable", global.TokenUsage)
+	}
 
 	assertSessionSearch(t, store, "Find sessions", "ses_fixture")
 	assertSessionSearch(t, store, "go test", "ses_fixture")

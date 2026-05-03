@@ -33,6 +33,7 @@ type SessionSummary struct {
 	MessageCount   int
 	PartCount      int
 	HeavyPartCount int
+	TokenUsage     opencode.TokenUsage
 	Tags           []string
 	Bookmarked     bool
 }
@@ -163,8 +164,8 @@ ON CONFLICT(id) DO UPDATE SET
 
 	for _, session := range snapshot.Sessions {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO sessions (id, project_id, project_path, directory, title, slug, version, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, source_path)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO sessions (id, project_id, project_path, directory, title, slug, version, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write, source_path)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   project_id = excluded.project_id,
   project_path = excluded.project_path,
@@ -179,7 +180,14 @@ ON CONFLICT(id) DO UPDATE SET
   message_count = excluded.message_count,
   part_count = excluded.part_count,
   heavy_part_count = excluded.heavy_part_count,
-  source_path = excluded.source_path`, session.ID, session.ProjectID, session.ProjectPath, session.Directory, session.Title, session.Slug, session.Version, session.ModelProvider, session.ModelID, millis(session.CreatedAt), millis(session.UpdatedAt), session.MessageCount, session.PartCount, session.HeavyPartCount, session.Source.Path); err != nil {
+  token_usage_available = excluded.token_usage_available,
+  token_total = excluded.token_total,
+  token_input = excluded.token_input,
+  token_output = excluded.token_output,
+  token_reasoning = excluded.token_reasoning,
+  token_cache_read = excluded.token_cache_read,
+  token_cache_write = excluded.token_cache_write,
+  source_path = excluded.source_path`, session.ID, session.ProjectID, session.ProjectPath, session.Directory, session.Title, session.Slug, session.Version, session.ModelProvider, session.ModelID, millis(session.CreatedAt), millis(session.UpdatedAt), session.MessageCount, session.PartCount, session.HeavyPartCount, boolInt(session.TokenUsage.Available), session.TokenUsage.Total, session.TokenUsage.Input, session.TokenUsage.Output, session.TokenUsage.Reasoning, session.TokenUsage.CacheRead, session.TokenUsage.CacheWrite, session.Source.Path); err != nil {
 			return fmt.Errorf("upsert session %s: %w", session.ID, err)
 		}
 		if err := upsertScanMetadataTx(ctx, tx, session.Source.Path, session.Source.SizeBytes, session.Source.ModTime); err != nil {
@@ -252,7 +260,7 @@ ON CONFLICT(session_id, part_id, scope) DO UPDATE SET content = excluded.content
 }
 
 func (s *Store) ListSessions(ctx context.Context) ([]SessionSummary, error) {
-	return s.querySessions(ctx, `SELECT id, project_id, project_path, directory, title, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count FROM sessions ORDER BY updated_at DESC, id`, nil)
+	return s.querySessions(ctx, `SELECT id, project_id, project_path, directory, title, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write FROM sessions ORDER BY updated_at DESC, id`, nil)
 }
 
 func (s *Store) SearchSessions(ctx context.Context, query string) ([]SessionSummary, error) {
@@ -262,7 +270,7 @@ func (s *Store) SearchSessions(ctx context.Context, query string) ([]SessionSumm
 	}
 	like := "%" + strings.ToLower(query) + "%"
 	return s.querySessions(ctx, `
-SELECT DISTINCT s.id, s.project_id, s.project_path, s.directory, s.title, s.model_provider, s.model_id, s.created_at, s.updated_at, s.message_count, s.part_count, s.heavy_part_count
+SELECT DISTINCT s.id, s.project_id, s.project_path, s.directory, s.title, s.model_provider, s.model_id, s.created_at, s.updated_at, s.message_count, s.part_count, s.heavy_part_count, s.token_usage_available, s.token_total, s.token_input, s.token_output, s.token_reasoning, s.token_cache_read, s.token_cache_write
 FROM sessions s
 LEFT JOIN searchable_documents d ON d.session_id = s.id
 LEFT JOIN tags t ON t.session_id = s.id
@@ -399,12 +407,14 @@ func (s *Store) querySessions(ctx context.Context, query string, args []any) ([]
 	for rows.Next() {
 		var session SessionSummary
 		var created, updated int64
-		if err := rows.Scan(&session.ID, &session.ProjectID, &session.ProjectPath, &session.Directory, &session.Title, &session.ModelProvider, &session.ModelID, &created, &updated, &session.MessageCount, &session.PartCount, &session.HeavyPartCount); err != nil {
+		var tokenUsageAvailable int
+		if err := rows.Scan(&session.ID, &session.ProjectID, &session.ProjectPath, &session.Directory, &session.Title, &session.ModelProvider, &session.ModelID, &created, &updated, &session.MessageCount, &session.PartCount, &session.HeavyPartCount, &tokenUsageAvailable, &session.TokenUsage.Total, &session.TokenUsage.Input, &session.TokenUsage.Output, &session.TokenUsage.Reasoning, &session.TokenUsage.CacheRead, &session.TokenUsage.CacheWrite); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
 		session.CreatedAt = fromMillis(created)
 		session.UpdatedAt = fromMillis(updated)
+		session.TokenUsage.Available = tokenUsageAvailable == 1
 		sessions = append(sessions, session)
 	}
 	if err := rows.Close(); err != nil {

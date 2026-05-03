@@ -12,5 +12,16 @@
   "model": {
     "providerID": "openai",
     "modelID": "gpt-test"
-  }
+  },
+  "tokens": {
+    "total": 321,
+    "input": 100,
+    "output": 70,
+    "reasoning": 20,
+    "cache": {
+      "read": 30,
+      "write": 10
+    }
+  },
+  "cost": 0.1234
 }

@@ -45,6 +45,7 @@ type Session struct {
 	MessageCount   int
 	PartCount      int
 	HeavyPartCount int
+	TokenUsage     TokenUsage
 	Messages       []Message
 	Source         FileRecord
 }
@@ -59,8 +60,19 @@ type Message struct {
 	ModelID       string
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+	TokenUsage    TokenUsage
 	Parts         []Part
 	Source        FileRecord
+}
+
+type TokenUsage struct {
+	Available  bool
+	Total      int64
+	Input      int64
+	Output     int64
+	Reasoning  int64
+	CacheRead  int64
+	CacheWrite int64
 }
 
 type Part struct {
