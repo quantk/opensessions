@@ -185,7 +185,7 @@ func TestTimelineJKScrollsWithinLongFocusedMessage(t *testing.T) {
 func TestTimelineOpensFocusedToolDetails(t *testing.T) {
 	repo := newFakeRepo(t)
 	rawPath := filepath.Join(t.TempDir(), "tool.json")
-	raw := []byte(`{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"go test ./..."}}}`)
+	raw := []byte(`{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"go test ./...","description":"Run tests","workdir":"/tmp/fixture"},"output":"ok"}}`)
 	if err := os.WriteFile(rawPath, raw, 0o644); err != nil {
 		t.Fatalf("write raw tool: %v", err)
 	}
@@ -213,8 +213,70 @@ func TestTimelineOpensFocusedToolDetails(t *testing.T) {
 	if model.mode != ViewRawPart {
 		t.Fatalf("mode = %v, want raw detail", model.mode)
 	}
-	if !strings.Contains(view, "Raw JSON") || !strings.Contains(view, "go test ./...") {
-		t.Fatalf("tool detail missing raw content:\n%s", view)
+	if !strings.Contains(view, "Pretty Detail") || strings.Contains(view, "Raw JSON") {
+		t.Fatalf("tool detail should default to pretty mode:\n%s", view)
+	}
+	if !strings.Contains(view, "Command") || !strings.Contains(view, "go test ./...") || !strings.Contains(view, "Workdir: /tmp/fixture") {
+		t.Fatalf("tool detail missing structured fields:\n%s", view)
+	}
+}
+
+func TestRawPartToggleShowsRawJSON(t *testing.T) {
+	repo := newFakeRepo(t)
+	raw := `{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"go test ./..."},"output":"ok"}}`
+	repo.rawParts["prt_tool"] = index.RawPart{PartID: "prt_tool", Kind: opencode.PartKindTool, ToolName: "bash", Status: "completed", RawJSON: raw, SizeBytes: int64(len(raw))}
+
+	model := NewModel(repo, repo.sessions).openRawPart("prt_tool")
+	if model.rawMode || !strings.Contains(model.View(), "Pretty Detail") {
+		t.Fatalf("detail should start in pretty mode:\n%s", model.View())
+	}
+
+	model.rawScroll = 999
+	model = sendKey(t, model, "R")
+	view := model.View()
+	if !model.rawMode || !strings.Contains(view, "Raw JSON") || !strings.Contains(view, `"command": "go test ./..."`) {
+		t.Fatalf("raw toggle did not show raw JSON:\n%s", view)
+	}
+	if model.rawScroll > model.maxRawScroll() {
+		t.Fatalf("raw scroll = %d, max = %d", model.rawScroll, model.maxRawScroll())
+	}
+
+	model = search(t, model, "command")
+	if !strings.Contains(model.View(), `"command": "go test ./..."`) || strings.Contains(model.View(), `"output": "ok"`) {
+		t.Fatalf("raw filter should apply to raw content:\n%s", model.View())
+	}
+	model = sendKey(t, model, "R")
+	view = model.View()
+	if model.rawMode || !strings.Contains(view, "Pretty Detail") || !strings.Contains(view, "Command") || strings.Contains(view, `"command"`) {
+		t.Fatalf("pretty toggle should filter pretty content:\n%s", view)
+	}
+}
+
+func TestPrettyDetailRendersGenericToolPatchAndFile(t *testing.T) {
+	repo := newFakeRepo(t)
+	unknownRaw := `{"type":"tool","tool":"custom_lookup","state":{"status":"failed","input":{"query":"needle","path":"src"},"output":{"error":"not found"},"metadata":{"duration":"1s"}}}`
+	patchRaw := `{"type":"patch","title":"Update README","path":"README.md","diff":"@@ -1 +1\n-old\n+new"}`
+	fileRaw := `{"type":"file","mime":"text/plain","filename":"README.md","source":{"type":"file","path":"README.md","text":{"value":"hello docs","start":1,"end":2}}}`
+	repo.rawParts["prt_unknown"] = index.RawPart{PartID: "prt_unknown", Kind: opencode.PartKindTool, ToolName: "custom_lookup", Status: "failed", RawJSON: unknownRaw, SizeBytes: int64(len(unknownRaw))}
+	repo.rawParts["prt_patch"] = index.RawPart{PartID: "prt_patch", Kind: opencode.PartKindPatch, Title: "Update README", RawJSON: patchRaw, SizeBytes: int64(len(patchRaw))}
+	repo.rawParts["prt_safe_file"] = index.RawPart{PartID: "prt_safe_file", Kind: opencode.PartKindFile, FilePath: "README.md", RawJSON: fileRaw, SizeBytes: int64(len(fileRaw))}
+
+	model := NewModel(repo, repo.sessions).openRawPart("prt_unknown")
+	view := model.View()
+	if !strings.Contains(view, "Tool Detail") || !strings.Contains(view, "custom_lookup") || !strings.Contains(view, "query: needle") || !strings.Contains(view, "error") {
+		t.Fatalf("generic tool detail missing expected fields:\n%s", view)
+	}
+
+	model = model.openRawPart("prt_patch")
+	view = model.View()
+	if !strings.Contains(view, "Patch Detail") || !strings.Contains(view, "README.md") || !strings.Contains(view, "Diff") || !strings.Contains(view, "+new") {
+		t.Fatalf("patch detail missing expected fields:\n%s", view)
+	}
+
+	model = model.openRawPart("prt_safe_file")
+	view = model.View()
+	if !strings.Contains(view, "File Detail") || !strings.Contains(view, "MIME: text/plain") || !strings.Contains(view, "Filename: README.md") || !strings.Contains(view, "hello docs") {
+		t.Fatalf("file detail missing expected fields:\n%s", view)
 	}
 }
 

@@ -59,7 +59,9 @@ type Model struct {
 
 	rawPart    index.RawPart
 	rawContent string
+	rawData    map[string]any
 	rawGuard   string
+	rawMode    bool
 	lastErr    error
 
 	width  int
@@ -152,6 +154,12 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.mode == ViewTimeline {
 			m.showReasoning = !m.showReasoning
 			m.normalizeTimelineFocus()
+		}
+		return m, nil
+	case "R":
+		if m.mode == ViewRawPart && m.rawGuard == "" && m.rawContent != "" {
+			m.rawMode = !m.rawMode
+			m.rawScroll = clamp(m.rawScroll, 0, m.maxRawScroll())
 		}
 		return m, nil
 	default:
@@ -316,13 +324,20 @@ func (m Model) openRawPart(partID string) Model {
 	m.mode = ViewRawPart
 	m.rawPart = raw
 	m.rawContent = ""
+	m.rawData = nil
 	m.rawGuard = ""
+	m.rawMode = false
 	m.rawScroll = 0
 	if raw.Heavy || raw.Binary || raw.SkippedRaw || raw.SizeBytes > MaxRawDisplayBytes {
 		m.rawGuard = "Raw part is too large or unsafe to display normally."
 		return m
 	}
 	if raw.RawJSON != "" {
+		if len(raw.RawJSON) > MaxRawDisplayBytes {
+			m.rawGuard = "Raw part is too large or unsafe to display normally."
+			return m
+		}
+		m.rawData = parseDetailPayload([]byte(raw.RawJSON))
 		m.rawContent = formatRawContent([]byte(raw.RawJSON))
 		return m
 	}
@@ -335,6 +350,7 @@ func (m Model) openRawPart(partID string) Model {
 		m.rawGuard = "Raw part is too large or unsafe to display normally."
 		return m
 	}
+	m.rawData = parseDetailPayload(content)
 	m.rawContent = formatRawContent(content)
 	return m
 }
@@ -416,7 +432,14 @@ func (m Model) renderFooter() string {
 	case ViewTimeline:
 		help = "j/k move focus  l/Enter details  r reasoning  h back  / search  q quit"
 	case ViewRawPart:
-		help = "j/k scroll  pgup/pgdown page  h back  / filter  q quit"
+		toggle := "R raw JSON"
+		if m.rawMode {
+			toggle = "R pretty detail"
+		}
+		if m.rawGuard != "" || m.rawContent == "" {
+			toggle = "raw unavailable"
+		}
+		help = fmt.Sprintf("j/k scroll  pgup/pgdown page  %s  h back  / filter  q quit", toggle)
 	default:
 		help = "q quit"
 	}
@@ -664,7 +687,7 @@ func (m Model) renderRawPart(height int) string {
 	kind := firstNonEmpty(string(m.rawPart.Kind), m.rawPart.Type, "part")
 	summary := firstNonEmpty(m.rawPart.ToolName, m.rawPart.Title, m.rawPart.FilePath, m.rawPart.PartID)
 	lines := []string{
-		titleStyle.Render(truncatePlain("Part Detail", width)),
+		titleStyle.Render(truncatePlain("Part Detail ("+m.rawModeLabel()+")", width)),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("%s  %s  %d bytes", kind, summary, m.rawPart.SizeBytes), width)),
 		dimStyle.Render(truncatePlain("Source: "+firstNonEmpty(m.rawPart.SourcePath, "unknown"), width)),
 	}
@@ -678,7 +701,7 @@ func (m Model) renderRawPart(height int) string {
 	contentHeight := max(1, height-len(lines)-1)
 	maxScroll := max(0, len(contentLines)-contentHeight)
 	start := clamp(m.rawScroll, 0, maxScroll)
-	lines = append(lines, accentStyle.Render("Raw JSON"))
+	lines = append(lines, accentStyle.Render(m.rawContentHeading()))
 	for _, line := range contentLines[start:min(len(contentLines), start+contentHeight)] {
 		lines = append(lines, truncatePlain(line, width))
 	}
@@ -686,11 +709,28 @@ func (m Model) renderRawPart(height int) string {
 }
 
 func (m Model) rawDisplayContent() string {
-	content := m.rawContent
+	content := renderPrettyPartDetail(m.rawPart, m.rawData)
+	if m.rawMode {
+		content = m.rawContent
+	}
 	if m.rawSearchQuery != "" {
 		content = matchingLines(content, m.rawSearchQuery)
 	}
 	return content
+}
+
+func (m Model) rawModeLabel() string {
+	if m.rawMode {
+		return "raw"
+	}
+	return "pretty"
+}
+
+func (m Model) rawContentHeading() string {
+	if m.rawMode {
+		return "Raw JSON"
+	}
+	return "Pretty Detail"
 }
 
 func (m Model) bodyHeight() int {
