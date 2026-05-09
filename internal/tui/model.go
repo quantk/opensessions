@@ -2749,11 +2749,24 @@ func joinColumns(left, right []string, leftWidth, rightWidth, gap, height int) s
 }
 
 func withTail(label, tail string, width int) string {
-	label = truncatePlain(label, width)
+	if width <= 0 {
+		return ""
+	}
+	label = strings.TrimSpace(label)
+	tail = strings.TrimSpace(tail)
+	if tail == "" {
+		return truncatePlain(label, width)
+	}
 	tail = truncatePlain(tail, width)
-	space := width - lipgloss.Width(label) - lipgloss.Width(tail)
+	tailWidth := lipgloss.Width(tail)
+	labelWidth := width - tailWidth - 1
+	if labelWidth <= 0 {
+		return tail
+	}
+	label = truncatePlain(label, labelWidth)
+	space := width - lipgloss.Width(label) - tailWidth
 	if space < 1 {
-		return truncatePlain(label+" "+tail, width)
+		space = 1
 	}
 	return label + strings.Repeat(" ", space) + tail
 }
@@ -2842,19 +2855,17 @@ func formatRawContent(content []byte) string {
 }
 
 func countLabel(session index.SessionSummary) string {
-	fields := []string{}
-	if usage := compactTokenUsage(session.TokenUsage); usage != "" {
-		fields = append(fields, usage)
+	if !session.TokenUsage.Available {
+		return ""
 	}
-	fields = append(fields, fmt.Sprintf("%dm", session.MessageCount), fmt.Sprintf("%dp", session.PartCount))
-	return strings.Join(fields, " ")
+	return formatTokenCount(session.TokenUsage.Total)
 }
 
 func compactTokenUsage(usage opencode.TokenUsage) string {
 	if !usage.Available {
 		return ""
 	}
-	return formatTokenCount(usage.Total) + " tok"
+	return formatTokenCount(usage.Total)
 }
 
 func tokenUsagePreviewLines(usage opencode.TokenUsage, width int) []string {
@@ -2868,13 +2879,7 @@ func tokenUsagePreviewLines(usage opencode.TokenUsage, width int) []string {
 }
 
 func formatTokenCount(value int64) string {
-	if value >= 1_000_000 {
-		return fmt.Sprintf("%.1fM", float64(value)/1_000_000)
-	}
-	if value >= 1_000 {
-		return fmt.Sprintf("%.1fk", float64(value)/1_000)
-	}
-	return fmt.Sprintf("%d", value)
+	return fmt.Sprintf("%.2fM", float64(value)/1_000_000)
 }
 
 func shortPath(value string) string {

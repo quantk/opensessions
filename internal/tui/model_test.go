@@ -340,12 +340,27 @@ func TestModelFiltersChildSessionsFromFlatAndGroupedLists(t *testing.T) {
 	}
 }
 
+func TestSessionListKeepsTokenUsageVisibleWithLongTitle(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions[0].Title = strings.Repeat("very long session title ", 8)
+	model := NewModel(repo, repo.sessions)
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 72, Height: 12})
+
+	plain := plainView(model.View())
+	if !strings.Contains(plain, "0.00M") {
+		t.Fatalf("token usage should stay visible when title is long:\n%s", model.View())
+	}
+	if strings.Contains(plain, "321 tok") || strings.Contains(plain, "2m") || strings.Contains(plain, "3p") {
+		t.Fatalf("session list token badge should only show token total in millions without suffix:\n%s", model.View())
+	}
+}
+
 func TestModelRendersSessionTokenUsage(t *testing.T) {
 	repo := newFakeRepo(t)
 	model := NewModel(repo, repo.sessions)
 
 	view := model.View()
-	if !strings.Contains(view, "321 tok") || !strings.Contains(view, "Tokens: total 321") || !strings.Contains(view, "cache read 30") || !strings.Contains(view, "cache write 10") {
+	if !strings.Contains(view, "0.00M") || strings.Contains(plainView(view), "tok") || !strings.Contains(view, "Tokens: total 0.00M") || !strings.Contains(view, "cache read 0.00M") {
 		t.Fatalf("session token usage missing from list/preview:\n%s", view)
 	}
 	if strings.Contains(strings.ToLower(view), "cost") {
@@ -354,7 +369,7 @@ func TestModelRendersSessionTokenUsage(t *testing.T) {
 
 	model = sendKey(t, model, "l")
 	view = model.View()
-	if !strings.Contains(view, "Tokens: 321 tok") {
+	if !strings.Contains(view, "Tokens: 0.00M") || strings.Contains(plainView(view), "tok") {
 		t.Fatalf("session token usage missing from detail header:\n%s", view)
 	}
 	if strings.Contains(strings.ToLower(view), "cost") {
