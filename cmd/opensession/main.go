@@ -10,6 +10,8 @@ import (
 	"github.com/quantick/opensession/internal/config"
 	"github.com/quantick/opensession/internal/index"
 	"github.com/quantick/opensession/internal/opencode"
+	"github.com/quantick/opensession/internal/pi"
+	"github.com/quantick/opensession/internal/source"
 	"github.com/quantick/opensession/internal/tui"
 )
 
@@ -25,8 +27,10 @@ func main() {
 func run(args []string) error {
 	flags := flag.NewFlagSet("opensession", flag.ContinueOnError)
 	storageRoot := flags.String("storage-root", "", "OpenCode storage root override")
+	piSessionsRoot := flags.String("pi-sessions-root", "", "Pi sessions root override")
+	sourceSelection := flags.String("source", "", "comma-separated sources to scan/display: all, opencode, pi")
 	dbPath := flags.String("db", "", "opensession SQLite database path override")
-	noScan := flags.Bool("no-scan", false, "skip scanning OpenCode storage before opening the TUI")
+	noScan := flags.Bool("no-scan", false, "skip scanning source storage before opening the TUI")
 	showVersion := flags.Bool("version", false, "print version and exit")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -36,7 +40,13 @@ func run(args []string) error {
 		return nil
 	}
 
-	cfg, err := config.Resolve(*storageRoot, *dbPath, *noScan)
+	cfg, err := config.ResolveWithOptions(config.ResolveOptions{
+		StorageRootOverride:     *storageRoot,
+		PiSessionsRootOverride:  *piSessionsRoot,
+		DBPathOverride:          *dbPath,
+		SourceSelectionOverride: *sourceSelection,
+		NoScan:                  *noScan,
+	})
 	if err != nil {
 		return err
 	}
@@ -49,24 +59,53 @@ func run(args []string) error {
 
 	ctx := context.Background()
 	if !cfg.NoScan {
-		paths, err := opencode.DiscoverSourcePaths(cfg.StorageRoot)
-		if err != nil {
-			return err
+		if sourceEnabled(cfg.Sources, source.KindOpenCode) {
+			paths, err := opencode.DiscoverSourcePaths(cfg.OpenCodeRoot)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return err
+				}
+			} else {
+				metadata, err := store.ScanMetadataBatch(ctx, paths)
+				if err != nil {
+					return err
+				}
+				existing, err := store.Snapshot(ctx)
+				if err != nil {
+					return err
+				}
+				snapshot, err := opencode.ScanWithMetadata(cfg.OpenCodeRoot, opencodeMetadata(metadata), existing)
+				if err != nil {
+					return err
+				}
+				if err := store.UpsertSnapshot(ctx, snapshot); err != nil {
+					return err
+				}
+			}
 		}
-		metadata, err := store.ScanMetadataBatch(ctx, paths)
-		if err != nil {
-			return err
-		}
-		existing, err := store.Snapshot(ctx)
-		if err != nil {
-			return err
-		}
-		snapshot, err := opencode.ScanWithMetadata(cfg.StorageRoot, opencodeMetadata(metadata), existing)
-		if err != nil {
-			return err
-		}
-		if err := store.UpsertSnapshot(ctx, snapshot); err != nil {
-			return err
+		if sourceEnabled(cfg.Sources, source.KindPi) {
+			paths, err := pi.DiscoverSourcePaths(cfg.PiSessionsRoot)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return err
+				}
+			} else {
+				metadata, err := store.ScanMetadataBatch(ctx, paths)
+				if err != nil {
+					return err
+				}
+				existing, err := store.Snapshot(ctx)
+				if err != nil {
+					return err
+				}
+				snapshot, err := pi.ScanWithMetadata(cfg.PiSessionsRoot, opencodeMetadata(metadata), existing)
+				if err != nil {
+					return err
+				}
+				if err := store.UpsertSnapshot(ctx, snapshot); err != nil {
+					return err
+				}
+			}
 		}
 	}
 
@@ -77,6 +116,15 @@ func run(args []string) error {
 	program := tea.NewProgram(tui.NewModel(store, sessions), tea.WithAltScreen())
 	_, err = program.Run()
 	return err
+}
+
+func sourceEnabled(sources []source.Kind, kind source.Kind) bool {
+	for _, sourceKind := range sources {
+		if sourceKind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func opencodeMetadata(metadata map[string]index.ScanMetadata) map[string]opencode.FileRecord {

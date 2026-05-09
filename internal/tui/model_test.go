@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,27 @@ func TestSessionListModeTogglePreservesSelectedSession(t *testing.T) {
 	}
 }
 
+func TestMixedSourceRowsRenderBadgesAndGroupByProjectPath(t *testing.T) {
+	base := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	sessions := []index.SessionSummary{
+		{SourceKind: "opencode", ID: "oc", ProjectID: "oc-proj", ProjectPath: "/tmp/shared", Title: "OpenCode", UpdatedAt: base.Add(time.Hour)},
+		{SourceKind: "pi", ID: "pi:s", ProjectID: "pi-project", ProjectPath: "/tmp/shared", Title: "Pi", UpdatedAt: base.Add(2 * time.Hour)},
+	}
+	model := NewModel(newFakeRepo(t), sessions)
+	view := plainView(model.View())
+	if !strings.Contains(view, "[pi] Pi") || !strings.Contains(view, "[opencode] OpenCode") || !strings.Contains(view, "Source: opencode") {
+		t.Fatalf("source badges missing:\n%s", view)
+	}
+	model = sendKey(t, model, "v")
+	rows := model.sessionRows()
+	if got := sessionHeaderLabels(rows); !reflect.DeepEqual(got, []string{"/tmp/shared"}) {
+		t.Fatalf("mixed source headers = %#v", got)
+	}
+	if got := groupSessionIDs(rows, "/tmp/shared"); !reflect.DeepEqual(got, []string{"pi:s", "oc"}) {
+		t.Fatalf("mixed source group ids = %#v", got)
+	}
+}
+
 func TestGroupedSessionRowsOrderByVisibleActivity(t *testing.T) {
 	rows := groupedSessionRows(sessionListModeTestSessions())
 	wantHeaders := []string{"/tmp/beta", "Global sessions", "/tmp/alpha"}
@@ -279,6 +301,88 @@ func TestModelRendersSessionTokenUsage(t *testing.T) {
 	}
 	if strings.Contains(view, "0 tok") {
 		t.Fatalf("unavailable token usage should not render zero total:\n%s", view)
+	}
+}
+
+func TestPiTreeNavigationSwitchesBranchAndBacksOut(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions = []index.SessionSummary{{SourceKind: "pi", ID: "pi:s", ProjectID: "pi-proj", ProjectPath: "/tmp/pi", Title: "Pi session"}}
+	repo.timelines["pi:s"] = []index.TimelinePart{{SourceKind: "pi", PartID: "prt_latest", MessageID: "pi:s:b", SessionID: "pi:s", Role: "user", Kind: opencode.PartKindText, Preview: "branch B latest"}}
+	repo.trees["pi:s"] = []index.SessionTreeEntry{
+		{SourceKind: "pi", ID: "pi:s:u", SessionID: "pi:s", Role: "user", AppendOrder: 1},
+		{SourceKind: "pi", ID: "pi:s:a", SessionID: "pi:s", ParentID: "pi:s:u", Role: "assistant", AppendOrder: 2},
+		{SourceKind: "pi", ID: "pi:s:branch-a", SessionID: "pi:s", ParentID: "pi:s:a", Role: "user", Label: "alt", AppendOrder: 3},
+		{SourceKind: "pi", ID: "pi:s:branch-b", SessionID: "pi:s", ParentID: "pi:s:a", Role: "user", Label: "chosen", AppendOrder: 4},
+	}
+	repo.branchTimelines["pi:s:branch-a"] = []index.TimelinePart{{SourceKind: "pi", PartID: "prt_a", MessageID: "pi:s:branch-a", SessionID: "pi:s", Role: "user", Kind: opencode.PartKindText, Preview: "branch A selected"}}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	if model.mode != ViewTimeline || model.activeEntryID != "pi:s:branch-b" {
+		t.Fatalf("Pi timeline did not default to latest branch:\n%s", model.View())
+	}
+	model = sendKey(t, model, "b")
+	if model.mode != ViewSessionTree || !strings.Contains(plainView(model.View()), "chosen") {
+		t.Fatalf("tree view missing label:\n%s", model.View())
+	}
+	model = sendKey(t, model, "k")
+	model = sendKey(t, model, "enter")
+	if model.mode != ViewTimeline || model.activeEntryID != "pi:s:branch-a" || !strings.Contains(plainView(model.View()), "branch A selected") {
+		t.Fatalf("branch switch failed: active=%q\n%s", model.activeEntryID, model.View())
+	}
+	model = sendKey(t, model, "b")
+	model = sendKey(t, model, "h")
+	if model.mode != ViewTimeline || model.activeEntryID != "pi:s:branch-a" {
+		t.Fatalf("tree back changed context: mode=%v active=%q", model.mode, model.activeEntryID)
+	}
+}
+
+func TestPiToolDetailUsesStoredRawJSONDespiteLargeSourceFile(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions = []index.SessionSummary{{SourceKind: "pi", ID: "pi:tool", ProjectPath: "/tmp/pi", Title: "Pi tools"}}
+	repo.timelines["pi:tool"] = []index.TimelinePart{{SourceKind: "pi", PartID: "pi_tool_small", SessionID: "pi:tool", MessageID: "pi:m1", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "bash", Preview: "go test", RawJSON: `{"type":"toolCall","name":"bash","arguments":{"command":"go test ./..."}}`, SizeBytes: MaxRawDisplayBytes + 1}}
+	repo.rawParts["pi_tool_small"] = index.RawPart{SourceKind: "pi", PartID: "pi_tool_small", SessionID: "pi:tool", MessageID: "pi:m1", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "bash", Preview: "go test", RawJSON: `{"type":"toolCall","name":"bash","arguments":{"command":"go test ./..."}}`, SizeBytes: MaxRawDisplayBytes + 1}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	model = sendKey(t, model, "enter")
+	view := plainView(model.View())
+	if strings.Contains(view, "too large or unsafe") {
+		t.Fatalf("stored Pi tool raw JSON should not be blocked by source file size:\n%s", model.View())
+	}
+	if !strings.Contains(view, "Tool Detail") && !strings.Contains(view, "go test") {
+		t.Fatalf("Pi tool detail missing:\n%s", model.View())
+	}
+}
+
+func TestPiMessageDetailRawAndReasoningGuardrails(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.sessions = []index.SessionSummary{{SourceKind: "pi", ID: "pi:detail", ProjectPath: "/tmp/pi", Title: "Pi detail"}}
+	repo.timelines["pi:detail"] = []index.TimelinePart{
+		{SourceKind: "pi", PartID: "pi_text", SessionID: "pi:detail", MessageID: "pi:m1", Role: "assistant", Kind: opencode.PartKindText, Preview: "# Pi detail", IndexText: "# Pi detail", RawJSON: `{"type":"text","text":"# Pi detail\n\nBody"}`},
+		{SourceKind: "pi", PartID: "pi_reasoning", SessionID: "pi:detail", MessageID: "pi:m2", Role: "assistant", Kind: opencode.PartKindReasoning, Preview: "hidden pi reasoning", IndexText: "hidden pi reasoning", RawJSON: `{"type":"thinking","text":"hidden pi reasoning"}`},
+		{SourceKind: "pi", PartID: "pi_tool", SessionID: "pi:detail", MessageID: "pi:m3", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "bash", Preview: "large", Heavy: true, SkippedRaw: true},
+	}
+	repo.rawParts["pi_tool"] = index.RawPart{SourceKind: "pi", PartID: "pi_tool", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "bash", Preview: "large", Heavy: true, SkippedRaw: true, SizeBytes: 1024 * 1024}
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	if strings.Contains(plainView(model.View()), "hidden pi reasoning") {
+		t.Fatalf("Pi reasoning should be hidden by default:\n%s", model.View())
+	}
+	model = sendKey(t, model, "enter")
+	if model.mode != ViewRawPart || !model.messageDetail.active || !strings.Contains(plainView(model.View()), "Pi detail") {
+		t.Fatalf("Pi text detail failed:\n%s", model.View())
+	}
+	model = sendKey(t, model, "h")
+	model = sendKey(t, model, "r")
+	if !strings.Contains(plainView(model.View()), "hidden pi reasoning") {
+		t.Fatalf("Pi reasoning toggle failed:\n%s", model.View())
+	}
+	model = sendKey(t, model, "j")
+	model = sendKey(t, model, "j")
+	model = sendKey(t, model, "enter")
+	if !strings.Contains(plainView(model.View()), "too large or unsafe") {
+		t.Fatalf("Pi heavy guard missing:\n%s", model.View())
 	}
 }
 
@@ -1150,6 +1254,8 @@ func requireSelectedSessionVisible(t *testing.T, model Model) {
 type fakeRepo struct {
 	sessions                  []index.SessionSummary
 	timelines                 map[string][]index.TimelinePart
+	trees                     map[string][]index.SessionTreeEntry
+	branchTimelines           map[string][]index.TimelinePart
 	rawParts                  map[string]index.RawPart
 	lastSessionSearch         string
 	lastTimelineSearchSession string
@@ -1174,6 +1280,8 @@ func newFakeRepo(t *testing.T) *fakeRepo {
 			},
 			"ses_global": {},
 		},
+		trees:           map[string][]index.SessionTreeEntry{},
+		branchTimelines: map[string][]index.TimelinePart{},
 		rawParts: map[string]index.RawPart{
 			"prt_heavy": {PartID: "prt_heavy", SourcePath: heavyPath, SizeBytes: 1024 * 1024, Heavy: true, SkippedRaw: true, Preview: "AAECAwQFBgc"},
 		},
@@ -1217,6 +1325,45 @@ func (f *fakeRepo) SearchSession(_ context.Context, sessionID, query string) ([]
 		content := part.Preview + " " + part.IndexText + " " + part.FilePath
 		if strings.Contains(strings.ToLower(content), strings.ToLower(query)) {
 			results = append(results, part)
+		}
+	}
+	return results, nil
+}
+
+func (f *fakeRepo) SessionTree(_ context.Context, sessionID string) ([]index.SessionTreeEntry, error) {
+	return f.trees[sessionID], nil
+}
+
+func (f *fakeRepo) SessionBranchLeaves(_ context.Context, sessionID string) ([]index.SessionTreeEntry, error) {
+	entries := f.trees[sessionID]
+	children := map[string]bool{}
+	for _, entry := range entries {
+		if entry.ParentID != "" {
+			children[entry.ParentID] = true
+		}
+	}
+	var leaves []index.SessionTreeEntry
+	for _, entry := range entries {
+		if !children[entry.ID] {
+			leaves = append(leaves, entry)
+		}
+	}
+	sort.SliceStable(leaves, func(i, j int) bool { return leaves[i].AppendOrder > leaves[j].AppendOrder })
+	return leaves, nil
+}
+
+func (f *fakeRepo) SessionTimelineForEntry(_ context.Context, sessionID, entryID string) ([]index.TimelinePart, error) {
+	if parts, ok := f.branchTimelines[entryID]; ok {
+		return parts, nil
+	}
+	return f.timelines[sessionID], nil
+}
+
+func (f *fakeRepo) SearchSessionTree(_ context.Context, sessionID, query string) ([]index.SessionTreeEntry, error) {
+	var results []index.SessionTreeEntry
+	for _, entry := range f.trees[sessionID] {
+		if strings.Contains(strings.ToLower(entry.ID+" "+entry.Label+" "+entry.Role+" "+entry.EntryType), strings.ToLower(query)) {
+			results = append(results, entry)
 		}
 	}
 	return results, nil

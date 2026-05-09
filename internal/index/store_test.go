@@ -3,11 +3,15 @@ package index
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/quantick/opensession/internal/opencode"
+	"github.com/quantick/opensession/internal/pi"
+	"github.com/quantick/opensession/internal/source"
 )
 
 func TestDefaultPath(t *testing.T) {
@@ -142,6 +146,58 @@ func TestStoreUpsertsSearchTagsBookmarksAndScanMetadata(t *testing.T) {
 	}
 }
 
+func TestStoreMigratesPreSourceDatabaseAsOpenCode(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "opensession.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open fixture db: %v", err)
+	}
+	mustExec(t, db, `CREATE TABLE projects (id TEXT PRIMARY KEY, worktree TEXT, vcs TEXT, created_at INTEGER, updated_at INTEGER, source_path TEXT)`)
+	mustExec(t, db, `CREATE TABLE sessions (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, project_path TEXT, directory TEXT, title TEXT, slug TEXT, version TEXT, model_provider TEXT, model_id TEXT, created_at INTEGER, updated_at INTEGER, message_count INTEGER NOT NULL DEFAULT 0, part_count INTEGER NOT NULL DEFAULT 0, heavy_part_count INTEGER NOT NULL DEFAULT 0, token_usage_available INTEGER NOT NULL DEFAULT 0, token_total INTEGER NOT NULL DEFAULT 0, token_input INTEGER NOT NULL DEFAULT 0, token_output INTEGER NOT NULL DEFAULT 0, token_reasoning INTEGER NOT NULL DEFAULT 0, token_cache_read INTEGER NOT NULL DEFAULT 0, token_cache_write INTEGER NOT NULL DEFAULT 0, source_path TEXT)`)
+	mustExec(t, db, `CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT, agent TEXT, summary_title TEXT, model_provider TEXT, model_id TEXT, token_usage_available INTEGER NOT NULL DEFAULT 0, token_total INTEGER NOT NULL DEFAULT 0, token_input INTEGER NOT NULL DEFAULT 0, token_output INTEGER NOT NULL DEFAULT 0, token_reasoning INTEGER NOT NULL DEFAULT 0, token_cache_read INTEGER NOT NULL DEFAULT 0, token_cache_write INTEGER NOT NULL DEFAULT 0, created_at INTEGER, updated_at INTEGER, source_path TEXT)`)
+	mustExec(t, db, `CREATE TABLE parts (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, message_id TEXT NOT NULL, type TEXT, kind TEXT, tool_name TEXT, status TEXT, title TEXT, subagent_name TEXT, linked_session_id TEXT, file_path TEXT, mime TEXT, filename TEXT, preview TEXT, index_text TEXT, raw_json TEXT, source_path TEXT, size_bytes INTEGER, heavy INTEGER NOT NULL DEFAULT 0, binary INTEGER NOT NULL DEFAULT 0, skipped_raw INTEGER NOT NULL DEFAULT 0, created_at INTEGER, updated_at INTEGER)`)
+	mustExec(t, db, `CREATE TABLE searchable_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, part_id TEXT NOT NULL, scope TEXT NOT NULL, content TEXT NOT NULL, UNIQUE(session_id, part_id, scope))`)
+	mustExec(t, db, `CREATE TABLE scan_metadata (path TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, mod_time INTEGER NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE tags (session_id TEXT NOT NULL, tag TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(session_id, tag))`)
+	mustExec(t, db, `CREATE TABLE bookmarks (session_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`)
+	mustExec(t, db, `INSERT INTO projects (id, worktree) VALUES ('proj_old', '/tmp/old')`)
+	mustExec(t, db, `INSERT INTO sessions (id, project_id, project_path, directory, title, slug, version, model_provider, model_id, created_at, updated_at, message_count, part_count) VALUES ('ses_old', 'proj_old', '/tmp/old', '/tmp/old', 'Old session', '', '', '', '', 1777800000000, 1777800000000, 1, 1)`)
+	mustExec(t, db, `INSERT INTO messages (id, session_id, role, created_at) VALUES ('msg_old', 'ses_old', 'assistant', 1777800000000)`)
+	mustExec(t, db, `INSERT INTO parts (id, session_id, message_id, kind, preview, index_text, created_at) VALUES ('prt_old', 'ses_old', 'msg_old', 'text', 'old preview', 'old searchable', 1777800000000)`)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close fixture db: %v", err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open migrated db: %v", err)
+	}
+	defer store.Close()
+
+	sessions, err := store.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "ses_old" || sessions[0].SourceKind != "opencode" {
+		t.Fatalf("migrated sessions = %#v", sessions)
+	}
+	if err := store.SetTag(ctx, "ses_old", "legacy"); err != nil {
+		t.Fatalf("SetTag: %v", err)
+	}
+	if err := store.SetBookmark(ctx, "ses_old", true); err != nil {
+		t.Fatalf("SetBookmark: %v", err)
+	}
+	tags, err := store.Tags(ctx, "ses_old")
+	if err != nil || len(tags) != 1 || tags[0] != "legacy" {
+		t.Fatalf("Tags = %#v err=%v", tags, err)
+	}
+	bookmarked, err := store.IsBookmarked(ctx, "ses_old")
+	if err != nil || !bookmarked {
+		t.Fatalf("IsBookmarked = %v err=%v", bookmarked, err)
+	}
+}
+
 func TestStoreSubagentMetadataAndTopLevelQueries(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(":memory:")
@@ -240,6 +296,98 @@ func TestStoreSubagentMetadataAndTopLevelQueries(t *testing.T) {
 	}
 	if len(childTimeline) != 1 || childTimeline[0].PartID != "prt_child_text" {
 		t.Fatalf("child timeline = %#v, want child text", childTimeline)
+	}
+}
+
+func TestStoreIndexesPiBranchesAndRefreshesChangedFiles(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	root := t.TempDir()
+	path := filepath.Join(root, "project", "session.jsonl")
+	writePiJSONL(t, path, []string{
+		`{"type":"session","id":"same-id","timestamp":"2026-05-09T10:00:00Z","cwd":"/tmp/pi"}`,
+		`{"type":"message","id":"u1","parentId":null,"timestamp":"2026-05-09T10:00:01Z","message":{"role":"user","content":"root prompt"}}`,
+		`{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-05-09T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"shared answer"}]}}`,
+		`{"type":"message","id":"branch-a","parentId":"a1","timestamp":"2026-05-09T10:00:03Z","message":{"role":"user","content":"branch A only"}}`,
+		`{"type":"message","id":"branch-b","parentId":"a1","timestamp":"2026-05-09T10:00:04Z","message":{"role":"user","content":"branch B latest"}}`,
+		`{"type":"label","id":"label-b","parentId":"branch-b","timestamp":"2026-05-09T10:00:05Z","targetId":"branch-b","label":"chosen"}`,
+	})
+	snapshot, err := pi.Scan(root)
+	if err != nil {
+		t.Fatalf("pi.Scan: %v", err)
+	}
+	if err := store.UpsertSnapshot(ctx, snapshot); err != nil {
+		t.Fatalf("UpsertSnapshot pi: %v", err)
+	}
+	sessions, err := store.ListSessions(ctx)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].SourceKind != string(source.KindPi) || sessions[0].ID != "pi:same-id" {
+		t.Fatalf("pi sessions = %#v", sessions)
+	}
+	timeline, err := store.SessionTimeline(ctx, "pi:same-id")
+	if err != nil {
+		t.Fatalf("SessionTimeline pi: %v", err)
+	}
+	if containsTimelineText(timeline, "branch A only") || !containsTimelineText(timeline, "branch B latest") {
+		t.Fatalf("latest branch timeline = %#v", timeline)
+	}
+	allBranchSearch, err := store.SearchSessions(ctx, "branch A only")
+	if err != nil || len(allBranchSearch) != 1 {
+		t.Fatalf("SearchSessions all branches = %#v err=%v", allBranchSearch, err)
+	}
+	currentBranchSearch, err := store.SearchSession(ctx, "pi:same-id", "branch A only")
+	if err != nil {
+		t.Fatalf("SearchSession branch: %v", err)
+	}
+	if len(currentBranchSearch) != 0 {
+		t.Fatalf("timeline search should use latest branch, got %#v", currentBranchSearch)
+	}
+	tree, err := store.SessionTree(ctx, "pi:same-id")
+	if err != nil {
+		t.Fatalf("SessionTree: %v", err)
+	}
+	if label := treeLabel(tree, "pi:same-id:branch-b"); label != "chosen" {
+		t.Fatalf("branch label = %q", label)
+	}
+	branchA, err := store.SessionTimelineForEntry(ctx, "pi:same-id", "pi:same-id:branch-a")
+	if err != nil {
+		t.Fatalf("SessionTimelineForEntry: %v", err)
+	}
+	if !containsTimelineText(branchA, "branch A only") || containsTimelineText(branchA, "branch B latest") {
+		t.Fatalf("branch A timeline = %#v", branchA)
+	}
+
+	changedTime := time.Date(2026, 5, 9, 11, 0, 0, 0, time.UTC)
+	writePiJSONL(t, path, []string{
+		`{"type":"session","id":"same-id","timestamp":"2026-05-09T11:00:00Z","cwd":"/tmp/pi"}`,
+		`{"type":"message","id":"u1","parentId":null,"timestamp":"2026-05-09T11:00:01Z","message":{"role":"user","content":"fresh only"}}`,
+	})
+	if err := os.Chtimes(path, changedTime, changedTime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	changed, err := pi.Scan(root)
+	if err != nil {
+		t.Fatalf("pi.Scan changed: %v", err)
+	}
+	if err := store.UpsertSnapshot(ctx, changed); err != nil {
+		t.Fatalf("UpsertSnapshot changed pi: %v", err)
+	}
+	stale, err := store.SearchSessions(ctx, "branch B latest")
+	if err != nil {
+		t.Fatalf("SearchSessions stale: %v", err)
+	}
+	if len(stale) != 0 {
+		t.Fatalf("stale Pi content remained: %#v", stale)
+	}
+	fresh, err := store.SearchSessions(ctx, "fresh only")
+	if err != nil || len(fresh) != 1 {
+		t.Fatalf("fresh Pi content missing: %#v err=%v", fresh, err)
 	}
 }
 
@@ -438,6 +586,34 @@ func incrementalSnapshot(root string, modTime time.Time, preview, indexText stri
 			}},
 		}},
 	}
+}
+
+func writePiJSONL(t *testing.T, path string, lines []string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir Pi JSONL: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write Pi JSONL: %v", err)
+	}
+}
+
+func containsTimelineText(parts []TimelinePart, text string) bool {
+	for _, part := range parts {
+		if strings.Contains(part.Preview, text) || strings.Contains(part.IndexText, text) {
+			return true
+		}
+	}
+	return false
+}
+
+func treeLabel(entries []SessionTreeEntry, id string) string {
+	for _, entry := range entries {
+		if entry.ID == id {
+			return entry.Label
+		}
+	}
+	return ""
 }
 
 func updateCount(t *testing.T, store *Store) int {

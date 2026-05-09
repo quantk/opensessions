@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/quantick/opensession/internal/index"
 	"github.com/quantick/opensession/internal/opencode"
+	"github.com/quantick/opensession/internal/source"
 )
 
 const (
@@ -28,6 +29,7 @@ type ViewMode int
 const (
 	ViewSessions ViewMode = iota
 	ViewTimeline
+	ViewSessionTree
 	ViewRawPart
 )
 
@@ -132,12 +134,24 @@ type timelineSearchResultMsg struct {
 	err       error
 }
 
+type treeSearchResultMsg struct {
+	requestID int
+	sessionID string
+	query     string
+	entries   []index.SessionTreeEntry
+	err       error
+}
+
 type Repository interface {
 	ListSessions(context.Context) ([]index.SessionSummary, error)
 	Session(context.Context, string) (index.SessionSummary, error)
 	SearchSessions(context.Context, string) ([]index.SessionSummary, error)
 	SessionTimeline(context.Context, string) ([]index.TimelinePart, error)
 	SearchSession(context.Context, string, string) ([]index.TimelinePart, error)
+	SessionTree(context.Context, string) ([]index.SessionTreeEntry, error)
+	SessionBranchLeaves(context.Context, string) ([]index.SessionTreeEntry, error)
+	SessionTimelineForEntry(context.Context, string, string) ([]index.TimelinePart, error)
+	SearchSessionTree(context.Context, string, string) ([]index.SessionTreeEntry, error)
 	RawPart(context.Context, string) (index.RawPart, error)
 }
 
@@ -150,13 +164,18 @@ type Model struct {
 	allSessions     []index.SessionSummary
 	timeline        []index.TimelinePart
 	allTimeline     []index.TimelinePart
+	treeEntries     []index.SessionTreeEntry
+	allTreeEntries  []index.SessionTreeEntry
 	timelineStack   []timelineContext
 	currentSession  index.SessionSummary
 	selectedSession int
 	selectedPart    int
+	selectedTree    int
 	sessionScroll   int
 	timelineScroll  int
+	treeScroll      int
 	rawScroll       int
+	activeEntryID   string
 
 	searchMode     bool
 	searchLoading  bool
@@ -272,6 +291,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applySessionSearchResult(typed), nil
 	case timelineSearchResultMsg:
 		return m.applyTimelineSearchResult(typed), nil
+	case treeSearchResultMsg:
+		return m.applyTreeSearchResult(typed), nil
 	default:
 		return m, nil
 	}
@@ -309,6 +330,11 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "tab", "shift+tab":
+		return m, nil
+	case "b":
+		if m.mode == ViewTimeline && isPiSource(m.currentSession.SourceKind) {
+			return m.openSessionTree(), nil
+		}
 		return m, nil
 	case "l", "enter":
 		return m.openSelected(), nil
@@ -402,6 +428,21 @@ func (m Model) applySearch() (Model, tea.Cmd) {
 			parts, err := m.repo.SearchSession(context.Background(), sessionID, query)
 			return timelineSearchResultMsg{requestID: requestID, sessionID: sessionID, query: query, parts: parts, err: err}
 		}
+	case ViewSessionTree:
+		if query == "" {
+			m.treeEntries = append([]index.SessionTreeEntry(nil), m.allTreeEntries...)
+			m.treeScroll = 0
+			m.selectedTree = 0
+			m.lastErr = nil
+			m.searchLoading = false
+			return m, nil
+		}
+		sessionID := m.currentSession.ID
+		m.searchLoading = true
+		return m, func() tea.Msg {
+			entries, err := m.repo.SearchSessionTree(context.Background(), sessionID, query)
+			return treeSearchResultMsg{requestID: requestID, sessionID: sessionID, query: query, entries: entries, err: err}
+		}
 	case ViewRawPart:
 		m.rawSearchQuery = query
 		m.rawScroll = 0
@@ -422,6 +463,22 @@ func (m Model) applySessionSearchResult(msg sessionSearchResultMsg) Model {
 	fallback := m.selectedSession
 	m.sessions = topLevelSessions(msg.sessions)
 	m.selectSessionByID(selectedID, fallback)
+	m.lastErr = nil
+	return m
+}
+
+func (m Model) applyTreeSearchResult(msg treeSearchResultMsg) Model {
+	if msg.requestID != m.searchRequest || m.mode != ViewSessionTree || msg.sessionID != m.currentSession.ID {
+		return m
+	}
+	m.searchLoading = false
+	if msg.err != nil {
+		m.lastErr = msg.err
+		return m
+	}
+	m.treeEntries = append([]index.SessionTreeEntry(nil), msg.entries...)
+	m.selectedTree = clamp(m.selectedTree, 0, max(0, len(m.treeEntries)-1))
+	m.treeScroll = clamp(m.treeScroll, 0, m.maxTreeScroll())
 	m.lastErr = nil
 	return m
 }
@@ -449,6 +506,8 @@ func (m *Model) move(delta int) {
 		m.moveSessionSelection(delta)
 	case ViewTimeline:
 		m.moveTimelineFocus(delta)
+	case ViewSessionTree:
+		m.moveTreeSelection(delta)
 	case ViewRawPart:
 		m.rawScroll = clamp(m.rawScroll+delta, 0, m.maxRawScroll())
 	}
@@ -462,6 +521,8 @@ func (m *Model) page(delta int) {
 	case ViewTimeline:
 		m.timelineScroll = clamp(m.timelineScroll+delta*amount, 0, m.maxTimelineScroll())
 		m.selectedPart = m.firstFocusablePartInViewport()
+	case ViewSessionTree:
+		m.moveTreeSelection(delta * amount)
 	case ViewRawPart:
 		m.rawScroll = clamp(m.rawScroll+delta*amount, 0, m.maxRawScroll())
 	}
@@ -480,6 +541,13 @@ func (m *Model) jump(bottom bool) {
 			m.selectedPart = m.firstFocusablePart()
 		}
 		m.ensureFocusedPartVisible()
+	case ViewSessionTree:
+		if bottom {
+			m.selectedTree = max(0, len(m.treeEntries)-1)
+		} else {
+			m.selectedTree = 0
+		}
+		m.ensureTreeSelectionVisible()
 	case ViewRawPart:
 		if bottom {
 			m.rawScroll = m.maxRawScroll()
@@ -505,6 +573,12 @@ func (m Model) openSelected() Model {
 		m.currentSession = session
 		m.timeline = parts
 		m.allTimeline = append([]index.TimelinePart(nil), parts...)
+		m.activeEntryID = ""
+		if isPiSource(session.SourceKind) {
+			if leaves, err := m.repo.SessionBranchLeaves(context.Background(), session.ID); err == nil && len(leaves) > 0 {
+				m.activeEntryID = leaves[0].ID
+			}
+		}
 		m.timelineStack = nil
 		m.timelineScroll = 0
 		m.showReasoning = false
@@ -529,11 +603,48 @@ func (m Model) openSelected() Model {
 			return m.openMessageDetail(part)
 		}
 		return m.openRawPart(part.PartID)
+	case ViewSessionTree:
+		if len(m.treeEntries) == 0 || m.selectedTree < 0 || m.selectedTree >= len(m.treeEntries) {
+			return m
+		}
+		entry := m.treeEntries[m.selectedTree]
+		parts, err := m.repo.SessionTimelineForEntry(context.Background(), m.currentSession.ID, entry.ID)
+		if err != nil {
+			m.lastErr = err
+			return m
+		}
+		m.cancelPendingSearch()
+		m.timeline = parts
+		m.allTimeline = append([]index.TimelinePart(nil), parts...)
+		m.activeEntryID = entry.ID
+		m.timelineScroll = 0
+		m.resetTimelineDisplayCache()
+		m.selectedPart = m.firstFocusablePartInViewport()
+		m.mode = ViewTimeline
+		m.lastErr = nil
+		return m
 	case ViewRawPart:
 		return m
 	default:
 		return m
 	}
+}
+
+func (m Model) openSessionTree() Model {
+	entries, err := m.repo.SessionTree(context.Background(), m.currentSession.ID)
+	if err != nil {
+		m.lastErr = err
+		return m
+	}
+	m.cancelPendingSearch()
+	m.treeEntries = entries
+	m.allTreeEntries = append([]index.SessionTreeEntry(nil), entries...)
+	m.selectedTree = m.treeIndexByID(m.activeEntryID)
+	m.treeScroll = 0
+	m.ensureTreeSelectionVisible()
+	m.mode = ViewSessionTree
+	m.lastErr = nil
+	return m
 }
 
 func (m Model) openLinkedSession(parentPartIndex int, parentPart index.TimelinePart) Model {
@@ -616,7 +727,7 @@ func (m *Model) loadRawDisplay(raw index.RawPart) {
 	m.rawContent = ""
 	m.rawData = nil
 	m.rawGuard = ""
-	if raw.Heavy || raw.Binary || raw.SkippedRaw || raw.SizeBytes > MaxRawDisplayBytes {
+	if raw.Heavy || raw.Binary || raw.SkippedRaw {
 		m.rawGuard = "Raw part is too large or unsafe to display normally."
 		return
 	}
@@ -627,6 +738,10 @@ func (m *Model) loadRawDisplay(raw index.RawPart) {
 		}
 		m.rawData = parseDetailPayload([]byte(raw.RawJSON))
 		m.rawContent = formatRawContent([]byte(raw.RawJSON))
+		return
+	}
+	if raw.SizeBytes > MaxRawDisplayBytes {
+		m.rawGuard = "Raw part is too large or unsafe to display normally."
 		return
 	}
 	content, err := os.ReadFile(raw.SourcePath)
@@ -662,6 +777,8 @@ func (m Model) back() Model {
 			break
 		}
 		m.mode = ViewSessions
+	case ViewSessionTree:
+		m.mode = ViewTimeline
 	case ViewRawPart:
 		m.mode = ViewTimeline
 	}
@@ -696,6 +813,8 @@ func (m Model) View() string {
 		sections = append(sections, m.renderSessions(height))
 	case ViewTimeline:
 		sections = append(sections, m.renderTimeline(height))
+	case ViewSessionTree:
+		sections = append(sections, m.renderSessionTree(height))
 	case ViewRawPart:
 		sections = append(sections, m.renderRawPart(height))
 	}
@@ -710,6 +829,8 @@ func (m Model) renderHeader() string {
 	case ViewSessions:
 		detail = fmt.Sprintf("%d sessions - %s mode", len(m.sessions), m.sessionListModeLabel())
 	case ViewTimeline:
+		detail = firstNonEmpty(m.currentSession.Title, m.currentSession.ID)
+	case ViewSessionTree:
 		detail = firstNonEmpty(m.currentSession.Title, m.currentSession.ID)
 	case ViewRawPart:
 		detail = firstNonEmpty(m.rawPart.ToolName, m.rawPart.Title, m.rawPart.FilePath, m.rawPart.PartID)
@@ -736,7 +857,13 @@ func (m Model) renderFooter() string {
 	case ViewSessions:
 		help = fmt.Sprintf("j/k move  l/Enter open  v %s view  / search  q quit", m.nextSessionListModeLabel())
 	case ViewTimeline:
-		help = fmt.Sprintf("j/k move focus  l/Enter open  r reasoning  %s  h back  / search  q quit", m.markdownToggleHelp())
+		branch := ""
+		if isPiSource(m.currentSession.SourceKind) {
+			branch = "  b tree"
+		}
+		help = fmt.Sprintf("j/k move focus  l/Enter open%s  r reasoning  %s  h back  / search  q quit", branch, m.markdownToggleHelp())
+	case ViewSessionTree:
+		help = "j/k move  l/Enter view branch  h back  / search  q quit"
 	case ViewRawPart:
 		toggle := "R raw JSON"
 		if m.rawMode {
@@ -799,7 +926,7 @@ func (m Model) sessionListLines(height, width int) []string {
 			continue
 		}
 		session := row.session
-		title := firstNonEmpty(session.Title, session.ID)
+		title := sourceBadge(session.SourceKind) + " " + firstNonEmpty(session.Title, session.ID)
 		if session.Bookmarked {
 			title = "* " + title
 		}
@@ -823,8 +950,9 @@ func (m Model) sessionPreviewLines(height, width int) []string {
 		return []string{"No selection."}
 	}
 	lines := []string{accentStyle.Render("Session")}
-	lines = appendWrapped(lines, firstNonEmpty(selected.Title, selected.ID), width, titleStyle)
+	lines = appendWrapped(lines, sourceBadge(selected.SourceKind)+" "+firstNonEmpty(selected.Title, selected.ID), width, titleStyle)
 	lines = append(lines,
+		dimStyle.Render(truncatePlain("Source: "+sourceLabel(selected.SourceKind), width)),
 		dimStyle.Render(truncatePlain("Project: "+groupName(selected), width)),
 		dimStyle.Render(truncatePlain("Model: "+firstNonEmpty(selected.ModelProvider, "unknown")+"/"+firstNonEmpty(selected.ModelID, "unknown"), width)),
 		dimStyle.Render(truncatePlain("Updated: "+formatTime(selected.UpdatedAt), width)),
@@ -859,6 +987,7 @@ func (m Model) renderTimeline(height int) string {
 
 func (m Model) timelineHeader(width int) []string {
 	metadata := []string{
+		"Source: " + sourceLabel(m.currentSession.SourceKind),
 		"Project: " + groupName(m.currentSession),
 		"Model: " + firstNonEmpty(m.currentSession.ModelProvider, "unknown") + "/" + firstNonEmpty(m.currentSession.ModelID, "unknown"),
 	}
@@ -866,6 +995,9 @@ func (m Model) timelineHeader(width int) []string {
 		metadata = append(metadata, "Tokens: "+usage)
 	}
 	metadata = append(metadata, "Reasoning: "+onOff(m.showReasoning), "Scroll: "+m.timelineScrollLabel())
+	if isPiSource(m.currentSession.SourceKind) {
+		metadata = append(metadata, "Branch: "+firstNonEmpty(shortID(m.activeEntryID), "latest"))
+	}
 	header := []string{
 		titleStyle.Render(truncatePlain(firstNonEmpty(m.currentSession.Title, m.currentSession.ID), width)),
 		dimStyle.Render(truncatePlain(strings.Join(metadata, "  "), width)),
@@ -889,6 +1021,44 @@ func (m Model) nestedTimelineContext() string {
 		}
 	}
 	return label
+}
+
+func (m Model) renderSessionTree(height int) string {
+	width := m.safeWidth()
+	lines := []string{
+		titleStyle.Render(truncatePlain(firstNonEmpty(m.currentSession.Title, m.currentSession.ID), width)),
+		dimStyle.Render(truncatePlain("Pi session tree  active "+firstNonEmpty(shortID(m.activeEntryID), "latest"), width)),
+	}
+	bodyHeight := max(1, height-len(lines))
+	if len(m.treeEntries) == 0 {
+		lines = append(lines, "No tree entries.")
+		return fitBlock(lines, height, width)
+	}
+	start := clamp(m.treeScroll, 0, m.maxTreeScroll())
+	end := min(len(m.treeEntries), start+bodyHeight)
+	depths := treeDepths(m.treeEntries)
+	childCounts := treeChildCounts(m.treeEntries)
+	for i := start; i < end; i++ {
+		entry := m.treeEntries[i]
+		prefix := marker(i == m.selectedTree) + strings.Repeat("  ", min(depths[entry.ID], 8))
+		shape := "─"
+		if childCounts[entry.ID] > 1 {
+			shape = "┬"
+		} else if childCounts[entry.ID] == 0 {
+			shape = "●"
+		}
+		label := firstNonEmpty(entry.Label, entry.Role, entry.EntryType, shortID(entry.ID))
+		line := prefix + shape + " " + label
+		if entry.ID == m.activeEntryID {
+			line += "  active"
+		}
+		line = withTail(line, shortID(entry.ID), width)
+		if i == m.selectedTree {
+			line = selectedStyle.Render(padPlain(line, width))
+		}
+		lines = append(lines, line)
+	}
+	return fitBlock(lines, height, width)
 }
 
 func (m Model) transcriptRows(width int) []transcriptLine {
@@ -1386,7 +1556,7 @@ func sessionGroupKey(session index.SessionSummary) string {
 	if session.ProjectID == "global" {
 		return "global"
 	}
-	return "project:" + firstNonEmpty(session.ProjectID, session.ProjectPath, session.Directory, "unknown")
+	return "project:" + firstNonEmpty(session.ProjectPath, session.Directory, session.ProjectID, "unknown")
 }
 
 func (m Model) sessionHeaderLine(row sessionListRow, width int) string {
@@ -1858,6 +2028,8 @@ func (m Model) modeLabel() string {
 		return "sessions"
 	case ViewTimeline:
 		return "chat"
+	case ViewSessionTree:
+		return "tree"
 	case ViewRawPart:
 		return "detail"
 	default:
@@ -1869,7 +2041,106 @@ func groupName(session index.SessionSummary) string {
 	if session.ProjectID == "global" {
 		return "Global sessions"
 	}
-	return firstNonEmpty(session.ProjectPath, session.ProjectID, "Unknown project")
+	return firstNonEmpty(session.ProjectPath, session.Directory, session.ProjectID, "Unknown project")
+}
+
+func sourceBadge(sourceKind string) string {
+	switch source.NormalizeKind(sourceKind) {
+	case source.KindPi:
+		return "[pi]"
+	case source.KindOpenCode:
+		return "[opencode]"
+	default:
+		return "[" + source.KindString(sourceKind) + "]"
+	}
+}
+
+func sourceLabel(sourceKind string) string {
+	return source.KindString(sourceKind)
+}
+
+func (m *Model) moveTreeSelection(delta int) {
+	if len(m.treeEntries) == 0 {
+		m.selectedTree = 0
+		m.treeScroll = 0
+		return
+	}
+	m.selectedTree = clamp(m.selectedTree+delta, 0, len(m.treeEntries)-1)
+	m.ensureTreeSelectionVisible()
+}
+
+func (m *Model) ensureTreeSelectionVisible() {
+	visible := max(1, m.bodyHeight()-2)
+	m.treeScroll = clamp(m.treeScroll, 0, m.maxTreeScroll())
+	if m.selectedTree < m.treeScroll {
+		m.treeScroll = m.selectedTree
+	}
+	if m.selectedTree >= m.treeScroll+visible {
+		m.treeScroll = m.selectedTree - visible + 1
+	}
+	m.treeScroll = clamp(m.treeScroll, 0, m.maxTreeScroll())
+}
+
+func (m Model) maxTreeScroll() int {
+	return max(0, len(m.treeEntries)-max(1, m.bodyHeight()-2))
+}
+
+func (m Model) treeIndexByID(id string) int {
+	if id != "" {
+		for i, entry := range m.treeEntries {
+			if entry.ID == id {
+				return i
+			}
+		}
+	}
+	return 0
+}
+
+func treeDepths(entries []index.SessionTreeEntry) map[string]int {
+	byID := make(map[string]index.SessionTreeEntry, len(entries))
+	for _, entry := range entries {
+		byID[entry.ID] = entry
+	}
+	depths := make(map[string]int, len(entries))
+	var depth func(string, map[string]bool) int
+	depth = func(id string, seen map[string]bool) int {
+		if value, ok := depths[id]; ok {
+			return value
+		}
+		entry, ok := byID[id]
+		if !ok || entry.ParentID == "" || seen[id] {
+			return 0
+		}
+		seen[id] = true
+		value := depth(entry.ParentID, seen) + 1
+		depths[id] = value
+		return value
+	}
+	for _, entry := range entries {
+		depth(entry.ID, map[string]bool{})
+	}
+	return depths
+}
+
+func treeChildCounts(entries []index.SessionTreeEntry) map[string]int {
+	counts := map[string]int{}
+	for _, entry := range entries {
+		if entry.ParentID != "" {
+			counts[entry.ParentID]++
+		}
+	}
+	return counts
+}
+
+func shortID(id string) string {
+	if idx := strings.LastIndex(id, ":"); idx >= 0 && idx+1 < len(id) {
+		return id[idx+1:]
+	}
+	return id
+}
+
+func isPiSource(sourceKind string) bool {
+	return source.NormalizeKind(sourceKind) == source.KindPi
 }
 
 func topLevelSessions(sessions []index.SessionSummary) []index.SessionSummary {

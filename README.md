@@ -1,12 +1,12 @@
 # opensession
 
-> A local, read-only terminal browser for your OpenCode session history.
+> A local, read-only terminal browser for OpenCode and Pi agent session history.
 
-`opensession` turns OpenCode's local session storage into a fast, searchable,
-keyboard-first TUI. It scans OpenCode JSON files and `opencode.db` in read-only
-mode, builds its own SQLite index, and lets you browse sessions, timelines,
-tool calls, markdown answers, token usage, and raw part details without touching
-OpenCode's storage.
+`opensession` turns local agent session storage into a fast, searchable,
+keyboard-first TUI. It scans OpenCode JSON files/`opencode.db` and Pi JSONL
+sessions in read-only mode, builds its own SQLite index, and lets you browse
+sessions, branches, timelines, tool calls, markdown answers, token usage, and raw
+part details without touching the source storage.
 
 ![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8?style=flat-square&logo=go)
 ![SQLite](https://img.shields.io/badge/SQLite-local-003B57?style=flat-square&logo=sqlite)
@@ -15,7 +15,7 @@ OpenCode's storage.
 
 ## Why
 
-OpenCode sessions contain a lot of valuable context: prompts, assistant
+Agent sessions contain a lot of valuable context: prompts, assistant
 responses, tool calls, file references, subagent tasks, token usage, and raw
 event metadata.
 
@@ -25,22 +25,24 @@ bug, changed a config, or ran a specific command becomes painful.
 `opensession` gives that history a local index and a focused terminal UI.
 
 ```text
-OpenCode storage              opensession index              Terminal UI
-JSON files / opencode.db      local SQLite DB                browse, search, inspect
+Agent storage                 opensession index              Terminal UI
+OpenCode / Pi sessions        local SQLite DB                browse, search, inspect
         |                            |                              |
         | read-only scan             | app-owned writes             |
         v                            v                              v
 +------------------+       +---------------------+       +----------------------+
-| project/session  | ----> | sessions/messages   | ----> | grouped session list |
-| message/part     |       | parts/search/tags   |       | timelines/details    |
+| OpenCode records | ----> | source-aware        | ----> | mixed session list   |
+| Pi JSONL trees   |       | sessions/parts/tags |       | branches/details     |
 +------------------+       +---------------------+       +----------------------+
 ```
 
 ## Features
 
-- Read-only OpenCode scanning: `opensession` never creates, edits, deletes, archives, or compacts files inside OpenCode storage.
-- Local SQLite index: sessions, messages, parts, search text, scan metadata, tags, and bookmarks live in an application-owned database.
-- Fast startup rescans: unchanged OpenCode records are skipped using source path, size, and modification time metadata.
+- Read-only source scanning: `opensession` never creates, edits, deletes, archives, compacts, forks, resumes, or labels files inside OpenCode or Pi storage.
+- Multi-source browsing: OpenCode and Pi sessions appear together with `[opencode]` / `[pi]` source badges; use `--source` to restrict scanning.
+- Pi branch browsing: Pi JSONL session trees open on the latest branch by default and provide a keyboard tree view for alternate branches.
+- Local SQLite index: sessions, entries/messages, parts, search text, scan metadata, tags, and bookmarks live in an application-owned database.
+- Fast startup rescans: unchanged source records are skipped using source path, size, and modification time metadata.
 - Flat or project-grouped browsing: switch between recency-ordered sessions and project-grouped views.
 - Timeline reader: open a session to inspect user messages, assistant messages, tool events, patches, files, and bounded previews.
 - Context-sensitive search: `/` searches sessions from the session list and searches only the current timeline inside a session.
@@ -51,7 +53,7 @@ JSON files / opencode.db      local SQLite DB                browse, search, ins
 - Explicit raw JSON view: raw content is only shown after an intentional action, and unsafe payloads are guarded.
 - Heavy payload protection: large tool artifacts, snapshots, binary-looking data URLs, and oversized text are summarized instead of fully indexed or rendered.
 - Token usage summaries: displays available total, input, output, reasoning, cache read, and cache write token counts without showing monetary cost.
-- Local tags and bookmarks: metadata is stored locally in the opensession database and never written back to OpenCode storage.
+- Local tags and bookmarks: metadata is stored locally in the opensession database and never written back to source storage.
 
 ## Install / Run
 
@@ -88,6 +90,21 @@ Use a custom OpenCode storage root:
 CGO_ENABLED=0 go run ./cmd/opensession --storage-root /path/to/opencode/storage
 ```
 
+Use a custom Pi sessions root:
+
+```sh
+CGO_ENABLED=0 go run ./cmd/opensession --pi-sessions-root /path/to/.pi/agent/sessions
+```
+
+Scan only one source:
+
+```sh
+CGO_ENABLED=0 go run ./cmd/opensession --source pi
+CGO_ENABLED=0 go run ./cmd/opensession --source opencode
+```
+
+The mixed session list uses source badges rather than an in-TUI source filter.
+
 Use a custom opensession SQLite index:
 
 ```sh
@@ -110,6 +127,7 @@ CGO_ENABLED=0 go run ./cmd/opensession --no-scan
 | `/` | Search the current view |
 | `v` | Toggle flat/grouped session list mode |
 | `r` | Show or hide reasoning parts in a timeline |
+| `b` | Open Pi branch/tree navigation from a Pi timeline |
 | `m` | Toggle assistant markdown rendering/source view |
 | `R` | Toggle pretty detail/raw JSON in part detail view |
 | `g` / `G` | Jump to top or bottom |
@@ -118,6 +136,11 @@ CGO_ENABLED=0 go run ./cmd/opensession --no-scan
 
 ## Storage Paths
 
+Source selection:
+
+1. `--source all|opencode|pi` (comma-separated values are allowed)
+2. default: `all`
+
 OpenCode storage root resolution order:
 
 1. `--storage-root`
@@ -125,6 +148,13 @@ OpenCode storage root resolution order:
 3. `OPENCODE_STORAGE_ROOT`
 4. `$XDG_DATA_HOME/opencode/storage`
 5. `~/.local/share/opencode/storage`
+
+Pi sessions root resolution order:
+
+1. `--pi-sessions-root`
+2. `OPENSESSION_PI_SESSIONS_ROOT`
+3. `PI_SESSIONS_ROOT`
+4. `~/.pi/agent/sessions`
 
 opensession SQLite database path resolution order:
 
@@ -135,10 +165,11 @@ opensession SQLite database path resolution order:
 
 ## Data Safety
 
-`opensession` treats OpenCode storage as source material, not as writable state.
+`opensession` treats OpenCode and Pi storage as source material, not as writable
+state.
 
 ```text
-OpenCode storage
+OpenCode storage / Pi JSONL sessions
         |
         | read only
         v
@@ -149,8 +180,8 @@ opensession scanner
 opensession.sqlite
 ```
 
-Browsing, searching, opening raw previews, reading child sessions, tags, and
-bookmarks do not mutate OpenCode files.
+Browsing, searching, opening raw previews, reading child sessions or Pi branches,
+tags, and bookmarks do not mutate OpenCode or Pi files.
 
 Large or unsafe raw parts are guarded. Normal views use bounded previews and
 searchable summaries instead of rendering full raw payloads.
@@ -201,11 +232,11 @@ gofmt -w ./path/to/file.go
 ## Status
 
 `opensession` is an early local-first tool focused on safe browsing, search,
-and inspection of OpenCode session history.
+and inspection of local agent session history.
 
 Possible next areas:
 
 - Dedicated TUI shortcuts for editing local tags and bookmarks.
 - Packaged release binaries.
-- Richer filters for projects, models, dates, tools, and tags.
+- Richer filters for sources, projects, models, dates, tools, and tags.
 - Export views for selected sessions or timelines.

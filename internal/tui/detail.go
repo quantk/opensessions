@@ -139,6 +139,7 @@ func safeMessageText(text string) bool {
 
 func rawPartFromTimelinePart(part index.TimelinePart) index.RawPart {
 	return index.RawPart{
+		SourceKind: part.SourceKind,
 		PartID:     part.PartID,
 		SessionID:  part.SessionID,
 		MessageID:  part.MessageID,

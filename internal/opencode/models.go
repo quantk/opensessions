@@ -22,15 +22,17 @@ type Snapshot struct {
 }
 
 type Project struct {
-	ID        string
-	Worktree  string
-	VCS       string
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	Source    FileRecord
+	SourceKind string
+	ID         string
+	Worktree   string
+	VCS        string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	Source     FileRecord
 }
 
 type Session struct {
+	SourceKind     string
 	ID             string
 	ProjectID      string
 	ParentID       string
@@ -52,8 +54,13 @@ type Session struct {
 }
 
 type Message struct {
+	SourceKind    string
 	ID            string
 	SessionID     string
+	ParentID      string
+	EntryType     string
+	AppendOrder   int
+	Label         string
 	Role          string
 	Agent         string
 	SummaryTitle  string
@@ -77,6 +84,7 @@ type TokenUsage struct {
 }
 
 type Part struct {
+	SourceKind      string
 	ID              string
 	SessionID       string
 	MessageID       string

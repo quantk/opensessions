@@ -10,6 +10,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 		`PRAGMA foreign_keys = ON`,
 		`CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
+  source_kind TEXT NOT NULL DEFAULT 'opencode',
   worktree TEXT,
   vcs TEXT,
   created_at INTEGER,
@@ -18,6 +19,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 )`,
 		`CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
+  source_kind TEXT NOT NULL DEFAULT 'opencode',
   project_id TEXT,
   parent_id TEXT,
   project_path TEXT,
@@ -43,7 +45,12 @@ func (s *Store) initSchema(ctx context.Context) error {
 )`,
 		`CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
+  source_kind TEXT NOT NULL DEFAULT 'opencode',
   session_id TEXT NOT NULL,
+  parent_id TEXT,
+  entry_type TEXT,
+  append_order INTEGER NOT NULL DEFAULT 0,
+  label TEXT,
   role TEXT,
   agent TEXT,
   summary_title TEXT,
@@ -63,6 +70,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 )`,
 		`CREATE TABLE IF NOT EXISTS parts (
   id TEXT PRIMARY KEY,
+  source_kind TEXT NOT NULL DEFAULT 'opencode',
   session_id TEXT NOT NULL,
   message_id TEXT NOT NULL,
   type TEXT,
@@ -90,6 +98,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 )`,
 		`CREATE TABLE IF NOT EXISTS searchable_documents (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_kind TEXT NOT NULL DEFAULT 'opencode',
   session_id TEXT NOT NULL,
   part_id TEXT NOT NULL,
   scope TEXT NOT NULL,
@@ -100,11 +109,13 @@ func (s *Store) initSchema(ctx context.Context) error {
 )`,
 		`CREATE TABLE IF NOT EXISTS scan_metadata (
   path TEXT PRIMARY KEY,
+  source_kind TEXT NOT NULL DEFAULT 'opencode',
   size_bytes INTEGER NOT NULL,
   mod_time INTEGER NOT NULL
 )`,
 		`CREATE TABLE IF NOT EXISTS tags (
   session_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL DEFAULT 'opencode',
   tag TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   PRIMARY KEY(session_id, tag),
@@ -112,6 +123,7 @@ func (s *Store) initSchema(ctx context.Context) error {
 )`,
 		`CREATE TABLE IF NOT EXISTS bookmarks (
   session_id TEXT PRIMARY KEY,
+  source_kind TEXT NOT NULL DEFAULT 'opencode',
   created_at INTEGER NOT NULL,
   FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 )`,
@@ -143,6 +155,24 @@ func (s *Store) initSchema(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "parts", "subagent_name", "TEXT"); err != nil {
 		return err
+	}
+	for _, table := range []string{"projects", "sessions", "messages", "parts", "searchable_documents", "scan_metadata", "tags", "bookmarks"} {
+		if err := s.ensureColumn(ctx, table, "source_kind", "TEXT NOT NULL DEFAULT 'opencode'"); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{"parent_id", "TEXT"},
+		{"entry_type", "TEXT"},
+		{"append_order", "INTEGER NOT NULL DEFAULT 0"},
+		{"label", "TEXT"},
+	} {
+		if err := s.ensureColumn(ctx, "messages", column.name, column.definition); err != nil {
+			return err
+		}
 	}
 	for _, column := range []struct {
 		name       string
@@ -178,6 +208,11 @@ func (s *Store) initSchema(ctx context.Context) error {
 	}
 	for _, statement := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_source_kind ON sessions(source_kind, updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_source_kind ON messages(source_kind, session_id, append_order)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_parts_source_kind ON parts(source_kind, session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_searchable_source_kind ON searchable_documents(source_kind, session_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_parts_linked_session ON parts(linked_session_id)`,
 	} {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {

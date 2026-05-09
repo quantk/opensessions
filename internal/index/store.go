@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/quantick/opensession/internal/opencode"
+	"github.com/quantick/opensession/internal/source"
 	_ "modernc.org/sqlite"
 )
 
@@ -22,6 +23,7 @@ type Store struct {
 }
 
 type SessionSummary struct {
+	SourceKind     string
 	ID             string
 	ProjectID      string
 	ParentID       string
@@ -41,6 +43,7 @@ type SessionSummary struct {
 }
 
 type TimelinePart struct {
+	SourceKind      string
 	PartID          string
 	SessionID       string
 	MessageID       string
@@ -65,7 +68,21 @@ type TimelinePart struct {
 	UpdatedAt       time.Time
 }
 
+type SessionTreeEntry struct {
+	SourceKind  string
+	ID          string
+	SessionID   string
+	ParentID    string
+	EntryType   string
+	Role        string
+	Label       string
+	Summary     string
+	AppendOrder int
+	CreatedAt   time.Time
+}
+
 type RawPart struct {
+	SourceKind string
 	PartID     string
 	SessionID  string
 	MessageID  string
@@ -87,9 +104,10 @@ type RawPart struct {
 }
 
 type ScanMetadata struct {
-	Path      string
-	SizeBytes int64
-	ModTime   time.Time
+	SourceKind string
+	Path       string
+	SizeBytes  int64
+	ModTime    time.Time
 }
 
 func DefaultPath(override string) (string, error) {
@@ -158,19 +176,20 @@ func (s *Store) UpsertSnapshot(ctx context.Context, snapshot opencode.Snapshot) 
 		projectChanged := !sourceUnchanged(project.Source, metadata)
 		if projectChanged {
 			if _, err := tx.ExecContext(ctx, `
-INSERT INTO projects (id, worktree, vcs, created_at, updated_at, source_path)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO projects (id, source_kind, worktree, vcs, created_at, updated_at, source_path)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
+  source_kind = excluded.source_kind,
   worktree = excluded.worktree,
   vcs = excluded.vcs,
   created_at = excluded.created_at,
   updated_at = excluded.updated_at,
-  source_path = excluded.source_path`, project.ID, project.Worktree, project.VCS, millis(project.CreatedAt), millis(project.UpdatedAt), project.Source.Path); err != nil {
+  source_path = excluded.source_path`, project.ID, snapshotSourceKind(project.SourceKind), project.Worktree, project.VCS, millis(project.CreatedAt), millis(project.UpdatedAt), project.Source.Path); err != nil {
 				return fmt.Errorf("upsert project %s: %w", project.ID, err)
 			}
 		}
 		if projectChanged && project.Source.Path != "" {
-			if err := upsertScanMetadataTx(ctx, tx, project.Source.Path, project.Source.SizeBytes, project.Source.ModTime); err != nil {
+			if err := upsertScanMetadataForSourceTx(ctx, tx, project.SourceKind, project.Source.Path, project.Source.SizeBytes, project.Source.ModTime); err != nil {
 				return err
 			}
 		}
@@ -180,9 +199,10 @@ ON CONFLICT(id) DO UPDATE SET
 		sessionChanged := dirtySessions[session.ID]
 		if sessionChanged {
 			if _, err := tx.ExecContext(ctx, `
-INSERT INTO sessions (id, project_id, parent_id, project_path, directory, title, slug, version, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write, source_path)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO sessions (id, source_kind, project_id, parent_id, project_path, directory, title, slug, version, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write, source_path)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
+  source_kind = excluded.source_kind,
   project_id = excluded.project_id,
   parent_id = excluded.parent_id,
   project_path = excluded.project_path,
@@ -204,13 +224,21 @@ ON CONFLICT(id) DO UPDATE SET
   token_reasoning = excluded.token_reasoning,
   token_cache_read = excluded.token_cache_read,
   token_cache_write = excluded.token_cache_write,
-  source_path = excluded.source_path`, session.ID, session.ProjectID, session.ParentID, session.ProjectPath, session.Directory, session.Title, session.Slug, session.Version, session.ModelProvider, session.ModelID, millis(session.CreatedAt), millis(session.UpdatedAt), session.MessageCount, session.PartCount, session.HeavyPartCount, boolInt(session.TokenUsage.Available), session.TokenUsage.Total, session.TokenUsage.Input, session.TokenUsage.Output, session.TokenUsage.Reasoning, session.TokenUsage.CacheRead, session.TokenUsage.CacheWrite, session.Source.Path); err != nil {
+  source_path = excluded.source_path`, session.ID, snapshotSourceKind(session.SourceKind), session.ProjectID, session.ParentID, session.ProjectPath, session.Directory, session.Title, session.Slug, session.Version, session.ModelProvider, session.ModelID, millis(session.CreatedAt), millis(session.UpdatedAt), session.MessageCount, session.PartCount, session.HeavyPartCount, boolInt(session.TokenUsage.Available), session.TokenUsage.Total, session.TokenUsage.Input, session.TokenUsage.Output, session.TokenUsage.Reasoning, session.TokenUsage.CacheRead, session.TokenUsage.CacheWrite, session.Source.Path); err != nil {
 				return fmt.Errorf("upsert session %s: %w", session.ID, err)
 			}
 		}
 		if !sourceUnchanged(session.Source, metadata) && session.Source.Path != "" {
-			if err := upsertScanMetadataTx(ctx, tx, session.Source.Path, session.Source.SizeBytes, session.Source.ModTime); err != nil {
+			if err := upsertScanMetadataForSourceTx(ctx, tx, session.SourceKind, session.Source.Path, session.Source.SizeBytes, session.Source.ModTime); err != nil {
 				return err
+			}
+		}
+		if sessionChanged && source.NormalizeKind(session.SourceKind) == source.KindPi {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM searchable_documents WHERE session_id = ?`, session.ID); err != nil {
+				return fmt.Errorf("delete stale Pi searchable documents %s: %w", session.ID, err)
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE session_id = ?`, session.ID); err != nil {
+				return fmt.Errorf("delete stale Pi entries %s: %w", session.ID, err)
 			}
 		}
 
@@ -218,10 +246,15 @@ ON CONFLICT(id) DO UPDATE SET
 			messageChanged := !sourceUnchanged(message.Source, metadata)
 			if messageChanged {
 				if _, err := tx.ExecContext(ctx, `
-INSERT INTO messages (id, session_id, role, agent, summary_title, model_provider, model_id, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write, created_at, updated_at, source_path)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO messages (id, source_kind, session_id, parent_id, entry_type, append_order, label, role, agent, summary_title, model_provider, model_id, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write, created_at, updated_at, source_path)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
+  source_kind = excluded.source_kind,
   session_id = excluded.session_id,
+  parent_id = excluded.parent_id,
+  entry_type = excluded.entry_type,
+  append_order = excluded.append_order,
+  label = excluded.label,
   role = excluded.role,
   agent = excluded.agent,
   summary_title = excluded.summary_title,
@@ -236,12 +269,12 @@ ON CONFLICT(id) DO UPDATE SET
   token_cache_write = excluded.token_cache_write,
   created_at = excluded.created_at,
   updated_at = excluded.updated_at,
-  source_path = excluded.source_path`, message.ID, message.SessionID, message.Role, message.Agent, message.SummaryTitle, message.ModelProvider, message.ModelID, boolInt(message.TokenUsage.Available), message.TokenUsage.Total, message.TokenUsage.Input, message.TokenUsage.Output, message.TokenUsage.Reasoning, message.TokenUsage.CacheRead, message.TokenUsage.CacheWrite, millis(message.CreatedAt), millis(message.UpdatedAt), message.Source.Path); err != nil {
+  source_path = excluded.source_path`, message.ID, snapshotSourceKind(message.SourceKind), message.SessionID, message.ParentID, message.EntryType, message.AppendOrder, message.Label, message.Role, message.Agent, message.SummaryTitle, message.ModelProvider, message.ModelID, boolInt(message.TokenUsage.Available), message.TokenUsage.Total, message.TokenUsage.Input, message.TokenUsage.Output, message.TokenUsage.Reasoning, message.TokenUsage.CacheRead, message.TokenUsage.CacheWrite, millis(message.CreatedAt), millis(message.UpdatedAt), message.Source.Path); err != nil {
 					return fmt.Errorf("upsert message %s: %w", message.ID, err)
 				}
 			}
 			if messageChanged && message.Source.Path != "" {
-				if err := upsertScanMetadataTx(ctx, tx, message.Source.Path, message.Source.SizeBytes, message.Source.ModTime); err != nil {
+				if err := upsertScanMetadataForSourceTx(ctx, tx, message.SourceKind, message.Source.Path, message.Source.SizeBytes, message.Source.ModTime); err != nil {
 					return err
 				}
 			}
@@ -250,9 +283,10 @@ ON CONFLICT(id) DO UPDATE SET
 				partChanged := !sourceUnchanged(part.Source, metadata)
 				if partChanged {
 					if _, err := tx.ExecContext(ctx, `
-INSERT INTO parts (id, session_id, message_id, type, kind, tool_name, status, title, subagent_name, linked_session_id, file_path, mime, filename, preview, index_text, raw_json, source_path, size_bytes, heavy, binary, skipped_raw, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO parts (id, source_kind, session_id, message_id, type, kind, tool_name, status, title, subagent_name, linked_session_id, file_path, mime, filename, preview, index_text, raw_json, source_path, size_bytes, heavy, binary, skipped_raw, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
+  source_kind = excluded.source_kind,
   session_id = excluded.session_id,
   message_id = excluded.message_id,
   type = excluded.type,
@@ -274,19 +308,19 @@ ON CONFLICT(id) DO UPDATE SET
   binary = excluded.binary,
   skipped_raw = excluded.skipped_raw,
   created_at = excluded.created_at,
-  updated_at = excluded.updated_at`, part.ID, part.SessionID, part.MessageID, part.Type, string(part.Kind), part.ToolName, part.Status, part.Title, part.SubagentName, part.LinkedSessionID, part.FilePath, part.MIME, part.Filename, part.Preview, part.IndexText, part.RawJSON, part.Source.Path, part.SizeBytes, boolInt(part.Heavy), boolInt(part.Binary), boolInt(part.SkippedRaw), millis(part.CreatedAt), millis(part.UpdatedAt)); err != nil {
+  updated_at = excluded.updated_at`, part.ID, snapshotSourceKind(part.SourceKind), part.SessionID, part.MessageID, part.Type, string(part.Kind), part.ToolName, part.Status, part.Title, part.SubagentName, part.LinkedSessionID, part.FilePath, part.MIME, part.Filename, part.Preview, part.IndexText, part.RawJSON, part.Source.Path, part.SizeBytes, boolInt(part.Heavy), boolInt(part.Binary), boolInt(part.SkippedRaw), millis(part.CreatedAt), millis(part.UpdatedAt)); err != nil {
 						return fmt.Errorf("upsert part %s: %w", part.ID, err)
 					}
 					if part.Source.Path != "" {
-						if err := upsertScanMetadataTx(ctx, tx, part.Source.Path, part.Source.SizeBytes, part.Source.ModTime); err != nil {
+						if err := upsertScanMetadataForSourceTx(ctx, tx, part.SourceKind, part.Source.Path, part.Source.SizeBytes, part.Source.ModTime); err != nil {
 							return err
 						}
 					}
 					if part.IndexText != "" {
 						if _, err := tx.ExecContext(ctx, `
-INSERT INTO searchable_documents (session_id, part_id, scope, content)
-VALUES (?, ?, 'part', ?)
-ON CONFLICT(session_id, part_id, scope) DO UPDATE SET content = excluded.content`, part.SessionID, part.ID, part.IndexText); err != nil {
+INSERT INTO searchable_documents (source_kind, session_id, part_id, scope, content)
+VALUES (?, ?, ?, 'part', ?)
+ON CONFLICT(session_id, part_id, scope) DO UPDATE SET source_kind = excluded.source_kind, content = excluded.content`, snapshotSourceKind(part.SourceKind), part.SessionID, part.ID, part.IndexText); err != nil {
 							return fmt.Errorf("upsert searchable document %s: %w", part.ID, err)
 						}
 					} else if _, err := tx.ExecContext(ctx, `DELETE FROM searchable_documents WHERE part_id = ? AND scope = 'part'`, part.ID); err != nil {
@@ -365,7 +399,7 @@ func (s *Store) Snapshot(ctx context.Context) (opencode.Snapshot, error) {
 
 func (s *Store) snapshotProjects(ctx context.Context) ([]opencode.Project, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT p.id, p.worktree, p.vcs, p.created_at, p.updated_at, coalesce(p.source_path, ''), coalesce(sm.size_bytes, 0), coalesce(sm.mod_time, 0)
+SELECT coalesce(p.source_kind, 'opencode'), p.id, p.worktree, p.vcs, p.created_at, p.updated_at, coalesce(p.source_path, ''), coalesce(sm.size_bytes, 0), coalesce(sm.mod_time, 0)
 FROM projects p
 LEFT JOIN scan_metadata sm ON sm.path = p.source_path`)
 	if err != nil {
@@ -376,7 +410,7 @@ LEFT JOIN scan_metadata sm ON sm.path = p.source_path`)
 	for rows.Next() {
 		var project opencode.Project
 		var created, updated, modTime int64
-		if err := rows.Scan(&project.ID, &project.Worktree, &project.VCS, &created, &updated, &project.Source.Path, &project.Source.SizeBytes, &modTime); err != nil {
+		if err := rows.Scan(&project.SourceKind, &project.ID, &project.Worktree, &project.VCS, &created, &updated, &project.Source.Path, &project.Source.SizeBytes, &modTime); err != nil {
 			return nil, err
 		}
 		project.CreatedAt = fromMillis(created)
@@ -389,7 +423,7 @@ LEFT JOIN scan_metadata sm ON sm.path = p.source_path`)
 
 func (s *Store) snapshotSessions(ctx context.Context) ([]opencode.Session, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT s.id, s.project_id, coalesce(s.parent_id, ''), s.project_path, s.directory, s.title, s.slug, s.version, s.model_provider, s.model_id, s.created_at, s.updated_at, s.message_count, s.part_count, s.heavy_part_count, s.token_usage_available, s.token_total, s.token_input, s.token_output, s.token_reasoning, s.token_cache_read, s.token_cache_write, coalesce(s.source_path, ''), coalesce(sm.size_bytes, 0), coalesce(sm.mod_time, 0)
+SELECT coalesce(s.source_kind, 'opencode'), s.id, s.project_id, coalesce(s.parent_id, ''), s.project_path, s.directory, s.title, s.slug, s.version, s.model_provider, s.model_id, s.created_at, s.updated_at, s.message_count, s.part_count, s.heavy_part_count, s.token_usage_available, s.token_total, s.token_input, s.token_output, s.token_reasoning, s.token_cache_read, s.token_cache_write, coalesce(s.source_path, ''), coalesce(sm.size_bytes, 0), coalesce(sm.mod_time, 0)
 FROM sessions s
 LEFT JOIN scan_metadata sm ON sm.path = s.source_path`)
 	if err != nil {
@@ -401,7 +435,7 @@ LEFT JOIN scan_metadata sm ON sm.path = s.source_path`)
 		var session opencode.Session
 		var created, updated, modTime int64
 		var tokenUsageAvailable int
-		if err := rows.Scan(&session.ID, &session.ProjectID, &session.ParentID, &session.ProjectPath, &session.Directory, &session.Title, &session.Slug, &session.Version, &session.ModelProvider, &session.ModelID, &created, &updated, &session.MessageCount, &session.PartCount, &session.HeavyPartCount, &tokenUsageAvailable, &session.TokenUsage.Total, &session.TokenUsage.Input, &session.TokenUsage.Output, &session.TokenUsage.Reasoning, &session.TokenUsage.CacheRead, &session.TokenUsage.CacheWrite, &session.Source.Path, &session.Source.SizeBytes, &modTime); err != nil {
+		if err := rows.Scan(&session.SourceKind, &session.ID, &session.ProjectID, &session.ParentID, &session.ProjectPath, &session.Directory, &session.Title, &session.Slug, &session.Version, &session.ModelProvider, &session.ModelID, &created, &updated, &session.MessageCount, &session.PartCount, &session.HeavyPartCount, &tokenUsageAvailable, &session.TokenUsage.Total, &session.TokenUsage.Input, &session.TokenUsage.Output, &session.TokenUsage.Reasoning, &session.TokenUsage.CacheRead, &session.TokenUsage.CacheWrite, &session.Source.Path, &session.Source.SizeBytes, &modTime); err != nil {
 			return nil, err
 		}
 		session.CreatedAt = fromMillis(created)
@@ -415,7 +449,7 @@ LEFT JOIN scan_metadata sm ON sm.path = s.source_path`)
 
 func (s *Store) snapshotMessages(ctx context.Context) ([]opencode.Message, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT m.id, m.session_id, m.role, m.agent, m.summary_title, m.model_provider, m.model_id, m.token_usage_available, m.token_total, m.token_input, m.token_output, m.token_reasoning, m.token_cache_read, m.token_cache_write, m.created_at, m.updated_at, coalesce(m.source_path, ''), coalesce(sm.size_bytes, 0), coalesce(sm.mod_time, 0)
+SELECT coalesce(m.source_kind, 'opencode'), m.id, m.session_id, coalesce(m.parent_id, ''), coalesce(m.entry_type, ''), coalesce(m.append_order, 0), coalesce(m.label, ''), m.role, m.agent, m.summary_title, m.model_provider, m.model_id, m.token_usage_available, m.token_total, m.token_input, m.token_output, m.token_reasoning, m.token_cache_read, m.token_cache_write, m.created_at, m.updated_at, coalesce(m.source_path, ''), coalesce(sm.size_bytes, 0), coalesce(sm.mod_time, 0)
 FROM messages m
 LEFT JOIN scan_metadata sm ON sm.path = m.source_path`)
 	if err != nil {
@@ -427,7 +461,7 @@ LEFT JOIN scan_metadata sm ON sm.path = m.source_path`)
 		var message opencode.Message
 		var created, updated, modTime int64
 		var tokenUsageAvailable int
-		if err := rows.Scan(&message.ID, &message.SessionID, &message.Role, &message.Agent, &message.SummaryTitle, &message.ModelProvider, &message.ModelID, &tokenUsageAvailable, &message.TokenUsage.Total, &message.TokenUsage.Input, &message.TokenUsage.Output, &message.TokenUsage.Reasoning, &message.TokenUsage.CacheRead, &message.TokenUsage.CacheWrite, &created, &updated, &message.Source.Path, &message.Source.SizeBytes, &modTime); err != nil {
+		if err := rows.Scan(&message.SourceKind, &message.ID, &message.SessionID, &message.ParentID, &message.EntryType, &message.AppendOrder, &message.Label, &message.Role, &message.Agent, &message.SummaryTitle, &message.ModelProvider, &message.ModelID, &tokenUsageAvailable, &message.TokenUsage.Total, &message.TokenUsage.Input, &message.TokenUsage.Output, &message.TokenUsage.Reasoning, &message.TokenUsage.CacheRead, &message.TokenUsage.CacheWrite, &created, &updated, &message.Source.Path, &message.Source.SizeBytes, &modTime); err != nil {
 			return nil, err
 		}
 		message.TokenUsage.Available = tokenUsageAvailable == 1
@@ -441,7 +475,7 @@ LEFT JOIN scan_metadata sm ON sm.path = m.source_path`)
 
 func (s *Store) snapshotParts(ctx context.Context) ([]opencode.Part, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT p.id, p.session_id, p.message_id, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.mime, p.filename, p.preview, p.index_text, '', coalesce(p.source_path, ''), p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at, coalesce(sm.size_bytes, p.size_bytes, 0), coalesce(sm.mod_time, 0)
+SELECT coalesce(p.source_kind, 'opencode'), p.id, p.session_id, p.message_id, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.mime, p.filename, p.preview, p.index_text, '', coalesce(p.source_path, ''), p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at, coalesce(sm.size_bytes, p.size_bytes, 0), coalesce(sm.mod_time, 0)
 FROM parts p
 LEFT JOIN scan_metadata sm ON sm.path = p.source_path`)
 	if err != nil {
@@ -454,7 +488,7 @@ LEFT JOIN scan_metadata sm ON sm.path = p.source_path`)
 		var kind string
 		var heavy, binary, skipped int
 		var created, updated, modTime int64
-		if err := rows.Scan(&part.ID, &part.SessionID, &part.MessageID, &part.Type, &kind, &part.ToolName, &part.Status, &part.Title, &part.SubagentName, &part.LinkedSessionID, &part.FilePath, &part.MIME, &part.Filename, &part.Preview, &part.IndexText, &part.RawJSON, &part.Source.Path, &part.SizeBytes, &heavy, &binary, &skipped, &created, &updated, &part.Source.SizeBytes, &modTime); err != nil {
+		if err := rows.Scan(&part.SourceKind, &part.ID, &part.SessionID, &part.MessageID, &part.Type, &kind, &part.ToolName, &part.Status, &part.Title, &part.SubagentName, &part.LinkedSessionID, &part.FilePath, &part.MIME, &part.Filename, &part.Preview, &part.IndexText, &part.RawJSON, &part.Source.Path, &part.SizeBytes, &heavy, &binary, &skipped, &created, &updated, &part.Source.SizeBytes, &modTime); err != nil {
 			return nil, err
 		}
 		part.Kind = opencode.PartKind(kind)
@@ -470,11 +504,11 @@ LEFT JOIN scan_metadata sm ON sm.path = p.source_path`)
 }
 
 func (s *Store) ListSessions(ctx context.Context) ([]SessionSummary, error) {
-	return s.querySessions(ctx, `SELECT id, project_id, coalesce(parent_id, ''), project_path, directory, title, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write FROM sessions WHERE coalesce(parent_id, '') = '' ORDER BY updated_at DESC, id`, nil)
+	return s.querySessions(ctx, `SELECT coalesce(source_kind, 'opencode'), id, project_id, coalesce(parent_id, ''), project_path, directory, title, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write FROM sessions WHERE coalesce(parent_id, '') = '' ORDER BY updated_at DESC, id`, nil)
 }
 
 func (s *Store) Session(ctx context.Context, sessionID string) (SessionSummary, error) {
-	sessions, err := s.querySessions(ctx, `SELECT id, project_id, coalesce(parent_id, ''), project_path, directory, title, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write FROM sessions WHERE id = ?`, []any{sessionID})
+	sessions, err := s.querySessions(ctx, `SELECT coalesce(source_kind, 'opencode'), id, project_id, coalesce(parent_id, ''), project_path, directory, title, model_provider, model_id, created_at, updated_at, message_count, part_count, heavy_part_count, token_usage_available, token_total, token_input, token_output, token_reasoning, token_cache_read, token_cache_write FROM sessions WHERE id = ?`, []any{sessionID})
 	if err != nil {
 		return SessionSummary{}, err
 	}
@@ -491,7 +525,7 @@ func (s *Store) SearchSessions(ctx context.Context, query string) ([]SessionSumm
 	}
 	like := "%" + strings.ToLower(query) + "%"
 	return s.querySessions(ctx, `
-SELECT DISTINCT s.id, s.project_id, coalesce(s.parent_id, ''), s.project_path, s.directory, s.title, s.model_provider, s.model_id, s.created_at, s.updated_at, s.message_count, s.part_count, s.heavy_part_count, s.token_usage_available, s.token_total, s.token_input, s.token_output, s.token_reasoning, s.token_cache_read, s.token_cache_write
+SELECT DISTINCT coalesce(s.source_kind, 'opencode'), s.id, s.project_id, coalesce(s.parent_id, ''), s.project_path, s.directory, s.title, s.model_provider, s.model_id, s.created_at, s.updated_at, s.message_count, s.part_count, s.heavy_part_count, s.token_usage_available, s.token_total, s.token_input, s.token_output, s.token_reasoning, s.token_cache_read, s.token_cache_write
 FROM sessions s
 LEFT JOIN searchable_documents d ON d.session_id = s.id
 LEFT JOIN tags t ON t.session_id = s.id
@@ -507,12 +541,127 @@ ORDER BY s.updated_at DESC, s.id`, []any{like, like, like, like, like, like, lik
 }
 
 func (s *Store) SessionTimeline(ctx context.Context, sessionID string) ([]TimelinePart, error) {
+	sourceKind, err := s.sourceKindForSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if source.NormalizeKind(sourceKind) == source.KindPi {
+		leaf, err := s.latestLeafEntry(ctx, sessionID)
+		if err != nil || leaf == "" {
+			return nil, err
+		}
+		return s.SessionTimelineForEntry(ctx, sessionID, leaf)
+	}
 	return s.queryTimeline(ctx, `
-SELECT p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
+SELECT coalesce(p.source_kind, 'opencode'), p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
 FROM parts p
 JOIN messages m ON m.id = p.message_id
 WHERE p.session_id = ?
 ORDER BY m.created_at, p.created_at, p.id`, sessionID)
+}
+
+func (s *Store) SessionTimelineForEntry(ctx context.Context, sessionID, entryID string) ([]TimelinePart, error) {
+	return s.queryTimeline(ctx, `
+WITH RECURSIVE path(id, parent_id, depth) AS (
+  SELECT id, parent_id, 0 FROM messages WHERE session_id = ? AND id = ?
+  UNION ALL
+  SELECT m.id, m.parent_id, path.depth + 1 FROM messages m JOIN path ON m.id = path.parent_id WHERE m.session_id = ?
+)
+SELECT coalesce(p.source_kind, 'opencode'), p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
+FROM path
+JOIN messages m ON m.id = path.id
+JOIN parts p ON p.message_id = m.id
+ORDER BY path.depth DESC, p.created_at, p.id`, sessionID, entryID, sessionID)
+}
+
+func (s *Store) SessionTree(ctx context.Context, sessionID string) ([]SessionTreeEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT coalesce(m.source_kind, 'opencode'), m.id, m.session_id, coalesce(m.parent_id, ''), coalesce(m.entry_type, ''), coalesce(m.role, ''), coalesce(m.label, ''), coalesce(m.summary_title, ''), coalesce(m.append_order, 0), m.created_at
+FROM messages m
+WHERE m.session_id = ?
+ORDER BY m.append_order, m.created_at, m.id`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []SessionTreeEntry
+	for rows.Next() {
+		var entry SessionTreeEntry
+		var created int64
+		if err := rows.Scan(&entry.SourceKind, &entry.ID, &entry.SessionID, &entry.ParentID, &entry.EntryType, &entry.Role, &entry.Label, &entry.Summary, &entry.AppendOrder, &created); err != nil {
+			return nil, err
+		}
+		entry.CreatedAt = fromMillis(created)
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
+func (s *Store) SearchSessionTree(ctx context.Context, sessionID, query string) ([]SessionTreeEntry, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return s.SessionTree(ctx, sessionID)
+	}
+	like := "%" + strings.ToLower(query) + "%"
+	rows, err := s.db.QueryContext(ctx, `
+SELECT DISTINCT coalesce(m.source_kind, 'opencode'), m.id, m.session_id, coalesce(m.parent_id, ''), coalesce(m.entry_type, ''), coalesce(m.role, ''), coalesce(m.label, ''), coalesce(m.summary_title, ''), coalesce(m.append_order, 0), m.created_at
+FROM messages m
+LEFT JOIN parts p ON p.message_id = m.id
+LEFT JOIN searchable_documents d ON d.session_id = m.session_id AND d.part_id = p.id
+WHERE m.session_id = ?
+  AND (lower(coalesce(m.entry_type, '')) LIKE ?
+   OR lower(coalesce(m.role, '')) LIKE ?
+   OR lower(coalesce(m.label, '')) LIKE ?
+   OR lower(coalesce(p.preview, '')) LIKE ?
+   OR lower(coalesce(p.index_text, '')) LIKE ?
+   OR lower(coalesce(d.content, '')) LIKE ?)
+ORDER BY m.append_order, m.created_at, m.id`, sessionID, like, like, like, like, like, like)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []SessionTreeEntry
+	for rows.Next() {
+		var entry SessionTreeEntry
+		var created int64
+		if err := rows.Scan(&entry.SourceKind, &entry.ID, &entry.SessionID, &entry.ParentID, &entry.EntryType, &entry.Role, &entry.Label, &entry.Summary, &entry.AppendOrder, &created); err != nil {
+			return nil, err
+		}
+		entry.CreatedAt = fromMillis(created)
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
+func (s *Store) SessionBranchLeaves(ctx context.Context, sessionID string) ([]SessionTreeEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT coalesce(m.source_kind, 'opencode'), m.id, m.session_id, coalesce(m.parent_id, ''), coalesce(m.entry_type, ''), coalesce(m.role, ''), coalesce(m.label, ''), coalesce(m.summary_title, ''), coalesce(m.append_order, 0), m.created_at
+FROM messages m
+WHERE m.session_id = ? AND NOT EXISTS (SELECT 1 FROM messages child WHERE child.parent_id = m.id)
+ORDER BY m.append_order DESC, m.created_at DESC, m.id`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []SessionTreeEntry
+	for rows.Next() {
+		var entry SessionTreeEntry
+		var created int64
+		if err := rows.Scan(&entry.SourceKind, &entry.ID, &entry.SessionID, &entry.ParentID, &entry.EntryType, &entry.Role, &entry.Label, &entry.Summary, &entry.AppendOrder, &created); err != nil {
+			return nil, err
+		}
+		entry.CreatedAt = fromMillis(created)
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
+func (s *Store) latestLeafEntry(ctx context.Context, sessionID string) (string, error) {
+	leaves, err := s.SessionBranchLeaves(ctx, sessionID)
+	if err != nil || len(leaves) == 0 {
+		return "", err
+	}
+	return leaves[0].ID, nil
 }
 
 func (s *Store) SearchSession(ctx context.Context, sessionID, query string) ([]TimelinePart, error) {
@@ -521,8 +670,31 @@ func (s *Store) SearchSession(ctx context.Context, sessionID, query string) ([]T
 		return s.SessionTimeline(ctx, sessionID)
 	}
 	like := "%" + strings.ToLower(query) + "%"
+	sourceKind, err := s.sourceKindForSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if source.NormalizeKind(sourceKind) == source.KindPi {
+		leaf, err := s.latestLeafEntry(ctx, sessionID)
+		if err != nil || leaf == "" {
+			return nil, err
+		}
+		return s.queryTimeline(ctx, `
+WITH RECURSIVE path(id, parent_id, depth) AS (
+  SELECT id, parent_id, 0 FROM messages WHERE session_id = ? AND id = ?
+  UNION ALL
+  SELECT m.id, m.parent_id, path.depth + 1 FROM messages m JOIN path ON m.id = path.parent_id WHERE m.session_id = ?
+)
+SELECT DISTINCT coalesce(p.source_kind, 'opencode'), p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
+FROM path
+JOIN messages m ON m.id = path.id
+JOIN parts p ON p.message_id = m.id
+LEFT JOIN searchable_documents d ON d.session_id = p.session_id AND d.part_id = p.id
+WHERE lower(coalesce(p.preview, '')) LIKE ? OR lower(coalesce(p.index_text, '')) LIKE ? OR lower(coalesce(d.content, '')) LIKE ?
+ORDER BY path.depth DESC, p.created_at, p.id`, sessionID, leaf, sessionID, like, like, like)
+	}
 	return s.queryTimeline(ctx, `
-SELECT DISTINCT p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
+SELECT DISTINCT coalesce(p.source_kind, 'opencode'), p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, coalesce(p.subagent_name, ''), coalesce(p.linked_session_id, ''), p.file_path, p.preview, p.index_text, coalesce(p.raw_json, ''), p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.created_at, p.updated_at
 FROM parts p
 JOIN messages m ON m.id = p.message_id
 LEFT JOIN searchable_documents d ON d.session_id = p.session_id AND d.part_id = p.id
@@ -536,7 +708,11 @@ func (s *Store) SetTag(ctx context.Context, sessionID, tag string) error {
 	if tag == "" {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO tags (session_id, tag, created_at) VALUES (?, ?, ?)`, sessionID, tag, millis(time.Now()))
+	sourceKind, err := s.sourceKindForSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO tags (session_id, source_kind, tag, created_at) VALUES (?, ?, ?, ?)`, sessionID, sourceKind, tag, millis(time.Now()))
 	return err
 }
 
@@ -562,8 +738,21 @@ func (s *Store) SetBookmark(ctx context.Context, sessionID string, bookmarked bo
 		_, err := s.db.ExecContext(ctx, `DELETE FROM bookmarks WHERE session_id = ?`, sessionID)
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO bookmarks (session_id, created_at) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET created_at = excluded.created_at`, sessionID, millis(time.Now()))
+	sourceKind, err := s.sourceKindForSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO bookmarks (session_id, source_kind, created_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET source_kind = excluded.source_kind, created_at = excluded.created_at`, sessionID, sourceKind, millis(time.Now()))
 	return err
+}
+
+func (s *Store) sourceKindForSession(ctx context.Context, sessionID string) (string, error) {
+	var sourceKind string
+	err := s.db.QueryRowContext(ctx, `SELECT coalesce(source_kind, 'opencode') FROM sessions WHERE id = ?`, sessionID).Scan(&sourceKind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return string(source.KindOpenCode), nil
+	}
+	return snapshotSourceKind(sourceKind), err
 }
 
 func (s *Store) IsBookmarked(ctx context.Context, sessionID string) (bool, error) {
@@ -583,10 +772,10 @@ func (s *Store) RawPart(ctx context.Context, partID string) (RawPart, error) {
 	var kind string
 	var heavy, binary, skipped int
 	err := s.db.QueryRowContext(ctx, `
-SELECT p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, p.file_path, p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.preview, p.index_text, coalesce(p.raw_json, '')
+SELECT coalesce(p.source_kind, 'opencode'), p.id, p.session_id, p.message_id, m.role, p.type, p.kind, p.tool_name, p.status, p.title, p.file_path, p.source_path, p.size_bytes, p.heavy, p.binary, p.skipped_raw, p.preview, p.index_text, coalesce(p.raw_json, '')
 FROM parts p
 JOIN messages m ON m.id = p.message_id
-WHERE p.id = ?`, partID).Scan(&part.PartID, &part.SessionID, &part.MessageID, &part.Role, &part.Type, &kind, &part.ToolName, &part.Status, &part.Title, &part.FilePath, &part.SourcePath, &part.SizeBytes, &heavy, &binary, &skipped, &part.Preview, &part.IndexText, &part.RawJSON)
+WHERE p.id = ?`, partID).Scan(&part.SourceKind, &part.PartID, &part.SessionID, &part.MessageID, &part.Role, &part.Type, &kind, &part.ToolName, &part.Status, &part.Title, &part.FilePath, &part.SourcePath, &part.SizeBytes, &heavy, &binary, &skipped, &part.Preview, &part.IndexText, &part.RawJSON)
 	if err != nil {
 		return RawPart{}, err
 	}
@@ -598,17 +787,21 @@ WHERE p.id = ?`, partID).Scan(&part.PartID, &part.SessionID, &part.MessageID, &p
 }
 
 func (s *Store) UpsertScanMetadata(ctx context.Context, path string, sizeBytes int64, modTime time.Time) error {
+	return s.UpsertScanMetadataForSource(ctx, string(source.KindOpenCode), path, sizeBytes, modTime)
+}
+
+func (s *Store) UpsertScanMetadataForSource(ctx context.Context, sourceKind, path string, sizeBytes int64, modTime time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO scan_metadata (path, size_bytes, mod_time)
-VALUES (?, ?, ?)
-ON CONFLICT(path) DO UPDATE SET size_bytes = excluded.size_bytes, mod_time = excluded.mod_time`, path, sizeBytes, nanos(modTime))
+INSERT INTO scan_metadata (path, source_kind, size_bytes, mod_time)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(path) DO UPDATE SET source_kind = excluded.source_kind, size_bytes = excluded.size_bytes, mod_time = excluded.mod_time`, path, snapshotSourceKind(sourceKind), sizeBytes, nanos(modTime))
 	return err
 }
 
 func (s *Store) ScanMetadata(ctx context.Context, path string) (ScanMetadata, bool, error) {
 	var metadata ScanMetadata
 	var mod int64
-	err := s.db.QueryRowContext(ctx, `SELECT path, size_bytes, mod_time FROM scan_metadata WHERE path = ?`, path).Scan(&metadata.Path, &metadata.SizeBytes, &mod)
+	err := s.db.QueryRowContext(ctx, `SELECT coalesce(source_kind, 'opencode'), path, size_bytes, mod_time FROM scan_metadata WHERE path = ?`, path).Scan(&metadata.SourceKind, &metadata.Path, &metadata.SizeBytes, &mod)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ScanMetadata{}, false, nil
 	}
@@ -634,7 +827,7 @@ func (s *Store) querySessions(ctx context.Context, query string, args []any) ([]
 		var session SessionSummary
 		var created, updated int64
 		var tokenUsageAvailable int
-		if err := rows.Scan(&session.ID, &session.ProjectID, &session.ParentID, &session.ProjectPath, &session.Directory, &session.Title, &session.ModelProvider, &session.ModelID, &created, &updated, &session.MessageCount, &session.PartCount, &session.HeavyPartCount, &tokenUsageAvailable, &session.TokenUsage.Total, &session.TokenUsage.Input, &session.TokenUsage.Output, &session.TokenUsage.Reasoning, &session.TokenUsage.CacheRead, &session.TokenUsage.CacheWrite); err != nil {
+		if err := rows.Scan(&session.SourceKind, &session.ID, &session.ProjectID, &session.ParentID, &session.ProjectPath, &session.Directory, &session.Title, &session.ModelProvider, &session.ModelID, &created, &updated, &session.MessageCount, &session.PartCount, &session.HeavyPartCount, &tokenUsageAvailable, &session.TokenUsage.Total, &session.TokenUsage.Input, &session.TokenUsage.Output, &session.TokenUsage.Reasoning, &session.TokenUsage.CacheRead, &session.TokenUsage.CacheWrite); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -740,7 +933,7 @@ func (s *Store) queryTimeline(ctx context.Context, query string, args ...any) ([
 		var kind string
 		var heavy, binary, skipped int
 		var created, updated int64
-		if err := rows.Scan(&part.PartID, &part.SessionID, &part.MessageID, &part.Role, &part.Type, &kind, &part.ToolName, &part.Status, &part.Title, &part.SubagentName, &part.LinkedSessionID, &part.FilePath, &part.Preview, &part.IndexText, &part.RawJSON, &part.SourcePath, &part.SizeBytes, &heavy, &binary, &skipped, &created, &updated); err != nil {
+		if err := rows.Scan(&part.SourceKind, &part.PartID, &part.SessionID, &part.MessageID, &part.Role, &part.Type, &kind, &part.ToolName, &part.Status, &part.Title, &part.SubagentName, &part.LinkedSessionID, &part.FilePath, &part.Preview, &part.IndexText, &part.RawJSON, &part.SourcePath, &part.SizeBytes, &heavy, &binary, &skipped, &created, &updated); err != nil {
 			return nil, err
 		}
 		part.Kind = opencode.PartKind(kind)
@@ -755,13 +948,17 @@ func (s *Store) queryTimeline(ctx context.Context, query string, args ...any) ([
 }
 
 func upsertScanMetadataTx(ctx context.Context, tx *sql.Tx, path string, sizeBytes int64, modTime time.Time) error {
+	return upsertScanMetadataForSourceTx(ctx, tx, string(source.KindOpenCode), path, sizeBytes, modTime)
+}
+
+func upsertScanMetadataForSourceTx(ctx context.Context, tx *sql.Tx, sourceKind, path string, sizeBytes int64, modTime time.Time) error {
 	if path == "" {
 		return nil
 	}
 	_, err := tx.ExecContext(ctx, `
-INSERT INTO scan_metadata (path, size_bytes, mod_time)
-VALUES (?, ?, ?)
-ON CONFLICT(path) DO UPDATE SET size_bytes = excluded.size_bytes, mod_time = excluded.mod_time`, path, sizeBytes, nanos(modTime))
+INSERT INTO scan_metadata (path, source_kind, size_bytes, mod_time)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(path) DO UPDATE SET source_kind = excluded.source_kind, size_bytes = excluded.size_bytes, mod_time = excluded.mod_time`, path, snapshotSourceKind(sourceKind), sizeBytes, nanos(modTime))
 	return err
 }
 
@@ -781,14 +978,14 @@ func scanMetadataBatchQuery(ctx context.Context, queryer queryContext, paths []s
 		for i, path := range chunk {
 			args[i] = path
 		}
-		rows, err := queryer.QueryContext(ctx, `SELECT path, size_bytes, mod_time FROM scan_metadata WHERE path IN (`+sqlPlaceholders(len(chunk))+`)`, args...)
+		rows, err := queryer.QueryContext(ctx, `SELECT coalesce(source_kind, 'opencode'), path, size_bytes, mod_time FROM scan_metadata WHERE path IN (`+sqlPlaceholders(len(chunk))+`)`, args...)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
 			var metadata ScanMetadata
 			var mod int64
-			if err := rows.Scan(&metadata.Path, &metadata.SizeBytes, &mod); err != nil {
+			if err := rows.Scan(&metadata.SourceKind, &metadata.Path, &metadata.SizeBytes, &mod); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
@@ -1041,6 +1238,10 @@ func shouldCreateParent(path string) bool {
 
 func rollback(tx *sql.Tx) {
 	_ = tx.Rollback()
+}
+
+func snapshotSourceKind(kind string) string {
+	return source.KindString(kind)
 }
 
 func boolInt(value bool) int {
