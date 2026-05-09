@@ -36,9 +36,16 @@ const (
 
 type SessionListMode int
 
+type SessionSortMode int
+
 const (
 	SessionListFlat SessionListMode = iota
 	SessionListGrouped
+)
+
+const (
+	SessionSortRecent SessionSortMode = iota
+	SessionSortTokens
 )
 
 type sessionListRowKind int
@@ -59,10 +66,11 @@ type sessionListRow struct {
 }
 
 type sessionListGroup struct {
-	key      string
-	label    string
-	activeAt time.Time
-	rows     []sessionListRow
+	key        string
+	label      string
+	activeAt   time.Time
+	tokenTotal int64
+	rows       []sessionListRow
 }
 
 type timelineContext struct {
@@ -166,6 +174,7 @@ type Model struct {
 
 	mode            ViewMode
 	sessionListMode SessionListMode
+	sessionSortMode SessionSortMode
 	sessions        []index.SessionSummary
 	allSessions     []index.SessionSummary
 	timeline        []index.TimelinePart
@@ -364,6 +373,11 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "v":
 		if m.mode == ViewSessions {
 			m.toggleSessionListMode()
+		}
+		return m, nil
+	case "t":
+		if m.mode == ViewSessions {
+			m.toggleSessionSortMode()
 		}
 		return m, nil
 	case "tab", "shift+tab":
@@ -945,7 +959,7 @@ func (m Model) renderHeader() string {
 	detail := ""
 	switch m.mode {
 	case ViewSessions:
-		detail = fmt.Sprintf("%d sessions - %s mode", len(m.sessions), m.sessionListModeLabel())
+		detail = fmt.Sprintf("%d sessions - %s mode - %s sort", len(m.sessions), m.sessionListModeLabel(), m.sessionSortModeLabel())
 	case ViewTimeline:
 		detail = firstNonEmpty(m.currentSession.Title, m.currentSession.ID)
 	case ViewSessionTree:
@@ -983,7 +997,7 @@ func (m Model) renderFooter() string {
 	var help string
 	switch m.mode {
 	case ViewSessions:
-		help = fmt.Sprintf("j/k move  l/Enter open  v %s view  / search  q quit", m.nextSessionListModeLabel())
+		help = fmt.Sprintf("j/k move  l/Enter open  v %s view  t %s sort  / search  q quit", m.nextSessionListModeLabel(), m.nextSessionSortModeLabel())
 	case ViewTimeline:
 		branch := ""
 		if isPiSource(m.currentSession.SourceKind) {
@@ -1049,7 +1063,7 @@ func (m Model) renderSessionsWide(height, width int) string {
 
 func (m Model) sessionListLines(height, width int) []string {
 	rows := m.sessionRows()
-	lines := []string{accentStyle.Render(padPlain(fmt.Sprintf("Sessions %d (%s)", len(m.sessions), m.sessionListModeLabel()), width))}
+	lines := []string{accentStyle.Render(padPlain(fmt.Sprintf("Sessions %d (%s, %s)", len(m.sessions), m.sessionListModeLabel(), m.sessionSortModeLabel()), width))}
 	visible := max(1, height-1)
 	start, end := m.sessionListWindow(rows, visible)
 	selectedRow := m.selectedSessionRowIndex(rows)
@@ -1910,6 +1924,30 @@ func (m Model) nextSessionListModeLabel() string {
 	return "grouped"
 }
 
+func (m *Model) toggleSessionSortMode() {
+	selectedID := m.selectedSessionID()
+	if m.sessionSortMode == SessionSortTokens {
+		m.sessionSortMode = SessionSortRecent
+	} else {
+		m.sessionSortMode = SessionSortTokens
+	}
+	m.selectSessionByID(selectedID, m.selectedSession)
+}
+
+func (m Model) sessionSortModeLabel() string {
+	if m.sessionSortMode == SessionSortTokens {
+		return "tokens"
+	}
+	return "recent"
+}
+
+func (m Model) nextSessionSortModeLabel() string {
+	if m.sessionSortMode == SessionSortTokens {
+		return "recent"
+	}
+	return "tokens"
+}
+
 func (m Model) markdownToggleHelp() string {
 	renderMarkdown := m.renderMarkdown
 	if m.mode == ViewRawPart && m.messageDetail.active {
@@ -1923,46 +1961,45 @@ func (m Model) markdownToggleHelp() string {
 
 func (m Model) sessionRows() []sessionListRow {
 	if m.sessionListMode == SessionListGrouped {
-		return groupedSessionRows(m.sessions)
+		return groupedSessionRows(m.sessions, m.sessionSortMode)
 	}
 	rows := make([]sessionListRow, 0, len(m.sessions))
 	for i, session := range m.sessions {
 		rows = append(rows, sessionListRow{kind: sessionListRowSession, session: session, sessionIndex: i})
 	}
+	if m.sessionSortMode == SessionSortTokens {
+		sortSessionRows(rows, m.sessionSortMode)
+	}
 	return rows
 }
 
-func groupedSessionRows(sessions []index.SessionSummary) []sessionListRow {
+func groupedSessionRows(sessions []index.SessionSummary, sortMode SessionSortMode) []sessionListRow {
 	groupsByKey := map[string]*sessionListGroup{}
 	for i, session := range sessions {
 		key := sessionGroupKey(session)
 		group := groupsByKey[key]
 		if group == nil {
-			group = &sessionListGroup{key: key, label: groupName(session)}
+			group = &sessionListGroup{key: key, label: groupName(session), tokenTotal: -1}
 			groupsByKey[key] = group
 		}
 		if session.UpdatedAt.After(group.activeAt) || group.activeAt.IsZero() {
 			group.activeAt = session.UpdatedAt
+		}
+		if tokenTotalForSort(session) > group.tokenTotal {
+			group.tokenTotal = tokenTotalForSort(session)
 		}
 		group.rows = append(group.rows, sessionListRow{kind: sessionListRowSession, session: session, sessionIndex: i})
 	}
 
 	groups := make([]sessionListGroup, 0, len(groupsByKey))
 	for _, group := range groupsByKey {
-		sort.SliceStable(group.rows, func(i, j int) bool {
-			left := group.rows[i]
-			right := group.rows[j]
-			if !left.session.UpdatedAt.Equal(right.session.UpdatedAt) {
-				return left.session.UpdatedAt.After(right.session.UpdatedAt)
-			}
-			if left.session.ID != right.session.ID {
-				return left.session.ID < right.session.ID
-			}
-			return left.sessionIndex < right.sessionIndex
-		})
+		sortSessionRows(group.rows, sortMode)
 		groups = append(groups, *group)
 	}
 	sort.SliceStable(groups, func(i, j int) bool {
+		if sortMode == SessionSortTokens && groups[i].tokenTotal != groups[j].tokenTotal {
+			return groups[i].tokenTotal > groups[j].tokenTotal
+		}
 		if !groups[i].activeAt.Equal(groups[j].activeAt) {
 			return groups[i].activeAt.After(groups[j].activeAt)
 		}
@@ -1978,6 +2015,34 @@ func groupedSessionRows(sessions []index.SessionSummary) []sessionListRow {
 		rows = append(rows, group.rows...)
 	}
 	return rows
+}
+
+func sortSessionRows(rows []sessionListRow, sortMode SessionSortMode) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		left := rows[i]
+		right := rows[j]
+		if sortMode == SessionSortTokens {
+			leftTokens := tokenTotalForSort(left.session)
+			rightTokens := tokenTotalForSort(right.session)
+			if leftTokens != rightTokens {
+				return leftTokens > rightTokens
+			}
+		}
+		if !left.session.UpdatedAt.Equal(right.session.UpdatedAt) {
+			return left.session.UpdatedAt.After(right.session.UpdatedAt)
+		}
+		if left.session.ID != right.session.ID {
+			return left.session.ID < right.session.ID
+		}
+		return left.sessionIndex < right.sessionIndex
+	})
+}
+
+func tokenTotalForSort(session index.SessionSummary) int64 {
+	if !session.TokenUsage.Available {
+		return -1
+	}
+	return session.TokenUsage.Total
 }
 
 func sessionGroupKey(session index.SessionSummary) string {

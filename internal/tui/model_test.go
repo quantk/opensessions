@@ -206,6 +206,57 @@ func TestAsyncTimelineSearchIgnoresStaleAndViewChangedResults(t *testing.T) {
 	_ = cmd1
 }
 
+func TestSessionTokenSortHotkeyOrdersByTokenTotal(t *testing.T) {
+	base := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	sessions := []index.SessionSummary{
+		{ID: "recent-low", ProjectPath: "/tmp/a", Title: "Recent low", UpdatedAt: base.Add(2 * time.Hour), TokenUsage: opencode.TokenUsage{Available: true, Total: 100_000}},
+		{ID: "old-high", ProjectPath: "/tmp/b", Title: "Old high", UpdatedAt: base, TokenUsage: opencode.TokenUsage{Available: true, Total: 2_500_000}},
+		{ID: "unavailable", ProjectPath: "/tmp/c", Title: "Unavailable", UpdatedAt: base.Add(time.Hour)},
+	}
+	model := NewModel(newFakeRepo(t), sessions)
+
+	rows := model.sessionRows()
+	if rows[0].session.ID != "recent-low" {
+		t.Fatalf("default session sort should be recent first: %#v", sessionRowIDs(rows))
+	}
+
+	model = sendKey(t, model, "t")
+	rows = model.sessionRows()
+	if model.sessionSortMode != SessionSortTokens || rows[0].session.ID != "old-high" || rows[1].session.ID != "recent-low" || rows[2].session.ID != "unavailable" {
+		t.Fatalf("token sort order = %#v, mode=%v", sessionRowIDs(rows), model.sessionSortMode)
+	}
+	plain := plainView(model.View())
+	if !strings.Contains(plain, "tokens sort") || !strings.Contains(plain, "t recent sort") {
+		t.Fatalf("token sort mode/help missing:\n%s", model.View())
+	}
+
+	model = sendKey(t, model, "t")
+	rows = model.sessionRows()
+	if model.sessionSortMode != SessionSortRecent || rows[0].session.ID != "recent-low" {
+		t.Fatalf("recent sort order = %#v, mode=%v", sessionRowIDs(rows), model.sessionSortMode)
+	}
+}
+
+func TestGroupedSessionTokenSortOrdersGroupsByLargestTokenTotal(t *testing.T) {
+	base := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	sessions := []index.SessionSummary{
+		{ID: "alpha-low", ProjectID: "alpha", ProjectPath: "/tmp/alpha", Title: "Alpha low", UpdatedAt: base.Add(3 * time.Hour), TokenUsage: opencode.TokenUsage{Available: true, Total: 100_000}},
+		{ID: "beta-high", ProjectID: "beta", ProjectPath: "/tmp/beta", Title: "Beta high", UpdatedAt: base, TokenUsage: opencode.TokenUsage{Available: true, Total: 2_500_000}},
+		{ID: "alpha-mid", ProjectID: "alpha", ProjectPath: "/tmp/alpha", Title: "Alpha mid", UpdatedAt: base.Add(2 * time.Hour), TokenUsage: opencode.TokenUsage{Available: true, Total: 500_000}},
+	}
+	model := NewModel(newFakeRepo(t), sessions)
+	model = sendKey(t, model, "v")
+	model = sendKey(t, model, "t")
+
+	rows := model.sessionRows()
+	if labels := sessionHeaderLabels(rows); !reflect.DeepEqual(labels, []string{"/tmp/beta", "/tmp/alpha"}) {
+		t.Fatalf("token-sorted group headers = %#v", labels)
+	}
+	if got := groupSessionIDs(rows, "/tmp/alpha"); !reflect.DeepEqual(got, []string{"alpha-mid", "alpha-low"}) {
+		t.Fatalf("token-sorted alpha sessions = %#v", got)
+	}
+}
+
 func TestSessionListModeTogglePreservesSelectedSession(t *testing.T) {
 	repo := newFakeRepo(t)
 	repo.sessions = sessionListModeTestSessions()
@@ -255,7 +306,7 @@ func TestMixedSourceRowsRenderBadgesAndGroupByProjectPath(t *testing.T) {
 }
 
 func TestGroupedSessionRowsOrderByVisibleActivity(t *testing.T) {
-	rows := groupedSessionRows(sessionListModeTestSessions())
+	rows := groupedSessionRows(sessionListModeTestSessions(), SessionSortRecent)
 	wantHeaders := []string{"/tmp/beta", "Global sessions", "/tmp/alpha"}
 	if got := sessionHeaderLabels(rows); !reflect.DeepEqual(got, wantHeaders) {
 		t.Fatalf("header labels = %#v, want %#v", got, wantHeaders)
@@ -360,7 +411,7 @@ func TestModelRendersSessionTokenUsage(t *testing.T) {
 	model := NewModel(repo, repo.sessions)
 
 	view := model.View()
-	if !strings.Contains(view, "0.00M") || strings.Contains(plainView(view), "tok") || !strings.Contains(view, "Tokens: total 0.00M") || !strings.Contains(view, "cache read 0.00M") {
+	if !strings.Contains(view, "0.00M") || strings.Contains(plainView(view), "0.00M tok") || !strings.Contains(view, "Tokens: total 0.00M") || !strings.Contains(view, "cache read 0.00M") {
 		t.Fatalf("session token usage missing from list/preview:\n%s", view)
 	}
 	if strings.Contains(strings.ToLower(view), "cost") {
@@ -369,7 +420,7 @@ func TestModelRendersSessionTokenUsage(t *testing.T) {
 
 	model = sendKey(t, model, "l")
 	view = model.View()
-	if !strings.Contains(view, "Tokens: 0.00M") || strings.Contains(plainView(view), "tok") {
+	if !strings.Contains(view, "Tokens: 0.00M") || strings.Contains(plainView(view), "0.00M tok") {
 		t.Fatalf("session token usage missing from detail header:\n%s", view)
 	}
 	if strings.Contains(strings.ToLower(view), "cost") {
@@ -1468,6 +1519,16 @@ func sessionListModeTestSessions() []index.SessionSummary {
 		{ID: "alpha-recent", ProjectID: "alpha", ProjectPath: "/tmp/alpha", Title: "Alpha Recent", UpdatedAt: base.Add(time.Hour)},
 		{ID: "alpha-match-old", ProjectID: "alpha", ProjectPath: "/tmp/alpha", Title: "Alpha Match Old", UpdatedAt: base},
 	}
+}
+
+func sessionRowIDs(rows []sessionListRow) []string {
+	var ids []string
+	for _, row := range rows {
+		if row.kind == sessionListRowSession {
+			ids = append(ids, row.session.ID)
+		}
+	}
+	return ids
 }
 
 func sessionHeaderLabels(rows []sessionListRow) []string {
