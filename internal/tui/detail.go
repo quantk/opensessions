@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/quantick/opensession/internal/index"
 	"github.com/quantick/opensession/internal/opencode"
@@ -21,6 +23,141 @@ type toolDetail struct {
 	Input       map[string]any
 	Output      any
 	Metadata    map[string]any
+}
+
+type messageDetailState struct {
+	active         bool
+	content        string
+	fallback       string
+	guard          string
+	truncated      bool
+	renderMarkdown bool
+}
+
+func buildMessageDetail(part index.TimelinePart, renderMarkdown bool) messageDetailState {
+	detail := messageDetailState{
+		active:         true,
+		fallback:       messageDetailFallback(part),
+		renderMarkdown: renderMarkdown && strings.EqualFold(strings.TrimSpace(part.Role), "assistant"),
+	}
+	text, ok, guard := loadMessageDetailText(part)
+	if !ok {
+		detail.guard = guard
+		return detail
+	}
+	if !safeMessageText(text) {
+		detail.guard = "Message text is unsafe or binary-looking; showing indexed preview when available."
+		return detail
+	}
+	detail.content, detail.truncated = capMessageDetailText(text)
+	detail.fallback = ""
+	return detail
+}
+
+func loadMessageDetailText(part index.TimelinePart) (string, bool, string) {
+	if part.Binary {
+		return "", false, "Message part is too large or unsafe to display normally."
+	}
+	if part.RawJSON != "" {
+		if len(part.RawJSON) > MaxRawDisplayBytes {
+			return "", false, "Message raw payload is too large to load for detail display."
+		}
+		return messageTextFromRawPayload([]byte(part.RawJSON))
+	}
+	if part.SourcePath == "" {
+		return "", false, "Message source text is unavailable."
+	}
+	if part.SizeBytes > MaxRawDisplayBytes {
+		return "", false, "Message source payload is too large to load for detail display."
+	}
+	if info, err := os.Stat(part.SourcePath); err == nil && info.Size() > MaxRawDisplayBytes {
+		return "", false, "Message source payload is too large to load for detail display."
+	}
+	content, err := os.ReadFile(part.SourcePath)
+	if err != nil {
+		return "", false, fmt.Sprintf("Message source could not be loaded: %v", err)
+	}
+	if len(content) > MaxRawDisplayBytes || bytes.ContainsRune(content, '\x00') || !utf8.Valid(content) {
+		return "", false, "Message source payload is too large or unsafe to display normally."
+	}
+	return messageTextFromRawPayload(content)
+}
+
+func messageTextFromRawPayload(content []byte) (string, bool, string) {
+	var data map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.UseNumber()
+	if err := decoder.Decode(&data); err != nil {
+		return "", false, fmt.Sprintf("Message raw payload could not be parsed: %v", err)
+	}
+	value, ok := data["text"].(string)
+	if !ok {
+		return "", false, "Message raw payload does not contain source text."
+	}
+	return value, true, ""
+}
+
+func capMessageDetailText(text string) (string, bool) {
+	runes := []rune(text)
+	if len(runes) <= MaxMessageDetailRunes {
+		return text, false
+	}
+	return string(runes[:MaxMessageDetailRunes]), true
+}
+
+func messageDetailFallback(part index.TimelinePart) string {
+	return firstNonEmpty(part.IndexText, part.Preview)
+}
+
+func (d messageDetailState) sourceContent() string {
+	if d.guard != "" {
+		lines := []string{d.guard}
+		if d.fallback != "" {
+			lines = append(lines, "", "Indexed Preview (may be incomplete)")
+			lines = append(lines, splitLines(d.fallback)...)
+		}
+		return strings.Join(lines, "\n")
+	}
+	content := d.content
+	if content == "" {
+		content = "[empty message]"
+	}
+	if d.truncated {
+		content = strings.TrimRight(content, "\n") + "\n\n" + messageDetailTruncationMarker()
+	}
+	return content
+}
+
+func messageDetailTruncationMarker() string {
+	return fmt.Sprintf("[message truncated at %d KiB]", MaxMessageDetailRunes/1024)
+}
+
+func safeMessageText(text string) bool {
+	lower := strings.ToLower(text)
+	return utf8.ValidString(text) && !strings.ContainsRune(text, '\x00') && !(strings.Contains(lower, "data:") && strings.Contains(lower, "base64"))
+}
+
+func rawPartFromTimelinePart(part index.TimelinePart) index.RawPart {
+	return index.RawPart{
+		PartID:     part.PartID,
+		SessionID:  part.SessionID,
+		MessageID:  part.MessageID,
+		Role:       part.Role,
+		Type:       part.Type,
+		Kind:       part.Kind,
+		ToolName:   part.ToolName,
+		Status:     part.Status,
+		Title:      part.Title,
+		FilePath:   part.FilePath,
+		SourcePath: part.SourcePath,
+		SizeBytes:  part.SizeBytes,
+		Heavy:      part.Heavy,
+		Binary:     part.Binary,
+		SkippedRaw: part.SkippedRaw,
+		Preview:    part.Preview,
+		IndexText:  part.IndexText,
+		RawJSON:    part.RawJSON,
+	}
 }
 
 func parseDetailPayload(content []byte) map[string]any {

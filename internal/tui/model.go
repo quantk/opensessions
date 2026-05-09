@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	MaxRawDisplayBytes = 256 * 1024
-	maxTranscriptRunes = 2000
+	MaxRawDisplayBytes    = 256 * 1024
+	MaxMessageDetailRunes = 128 * 1024
+	maxTranscriptRunes    = 2000
 )
 
 type ViewMode int
@@ -165,12 +166,13 @@ type Model struct {
 	showReasoning  bool
 	renderMarkdown bool
 
-	rawPart    index.RawPart
-	rawContent string
-	rawData    map[string]any
-	rawGuard   string
-	rawMode    bool
-	lastErr    error
+	rawPart       index.RawPart
+	rawContent    string
+	rawData       map[string]any
+	rawGuard      string
+	rawMode       bool
+	messageDetail messageDetailState
+	lastErr       error
 
 	width  int
 	height int
@@ -325,6 +327,9 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.invalidateTimelineLayout()
 			m.timelineScroll = clamp(m.timelineScroll, 0, m.maxTimelineScroll())
 			m.normalizeTimelineFocus()
+		} else if m.mode == ViewRawPart && m.messageDetail.active && isAssistantRole(m.rawPart.Role) && !m.rawMode {
+			m.messageDetail.renderMarkdown = !m.messageDetail.renderMarkdown
+			m.rawScroll = clamp(m.rawScroll, 0, m.maxRawScroll())
 		}
 		return m, nil
 	case "R":
@@ -520,6 +525,9 @@ func (m Model) openSelected() Model {
 		if isLinkedTaskPart(part) {
 			return m.openLinkedSession(partIndex, part)
 		}
+		if isMessageDetailPart(part) {
+			return m.openMessageDetail(part)
+		}
 		return m.openRawPart(part.PartID)
 	case ViewRawPart:
 		return m
@@ -581,36 +589,57 @@ func (m Model) openRawPart(partID string) Model {
 	m.cancelPendingSearch()
 	m.mode = ViewRawPart
 	m.rawPart = raw
+	m.rawSearchQuery = ""
+	m.messageDetail = messageDetailState{}
+	m.rawMode = false
+	m.rawScroll = 0
+	m.loadRawDisplay(raw)
+	m.lastErr = nil
+	return m
+}
+
+func (m Model) openMessageDetail(part index.TimelinePart) Model {
+	raw := rawPartFromTimelinePart(part)
+	m.cancelPendingSearch()
+	m.mode = ViewRawPart
+	m.rawPart = raw
+	m.rawSearchQuery = ""
+	m.rawMode = false
+	m.rawScroll = 0
+	m.messageDetail = buildMessageDetail(part, m.renderMarkdown)
+	m.loadRawDisplay(raw)
+	m.lastErr = nil
+	return m
+}
+
+func (m *Model) loadRawDisplay(raw index.RawPart) {
 	m.rawContent = ""
 	m.rawData = nil
 	m.rawGuard = ""
-	m.rawMode = false
-	m.rawScroll = 0
 	if raw.Heavy || raw.Binary || raw.SkippedRaw || raw.SizeBytes > MaxRawDisplayBytes {
 		m.rawGuard = "Raw part is too large or unsafe to display normally."
-		return m
+		return
 	}
 	if raw.RawJSON != "" {
 		if len(raw.RawJSON) > MaxRawDisplayBytes {
 			m.rawGuard = "Raw part is too large or unsafe to display normally."
-			return m
+			return
 		}
 		m.rawData = parseDetailPayload([]byte(raw.RawJSON))
 		m.rawContent = formatRawContent([]byte(raw.RawJSON))
-		return m
+		return
 	}
 	content, err := os.ReadFile(raw.SourcePath)
 	if err != nil {
 		m.rawGuard = fmt.Sprintf("Raw part could not be loaded: %v", err)
-		return m
+		return
 	}
 	if len(content) > MaxRawDisplayBytes {
 		m.rawGuard = "Raw part is too large or unsafe to display normally."
-		return m
+		return
 	}
 	m.rawData = parseDetailPayload(content)
 	m.rawContent = formatRawContent(content)
-	return m
 }
 
 func (m Model) back() Model {
@@ -683,7 +712,7 @@ func (m Model) renderHeader() string {
 	case ViewTimeline:
 		detail = firstNonEmpty(m.currentSession.Title, m.currentSession.ID)
 	case ViewRawPart:
-		detail = firstNonEmpty(m.rawPart.ToolName, m.rawPart.Title, m.rawPart.PartID)
+		detail = firstNonEmpty(m.rawPart.ToolName, m.rawPart.Title, m.rawPart.FilePath, m.rawPart.PartID)
 	}
 	plainDetail := truncatePlain(detail, max(0, width-24))
 	line := titleStyle.Render("opensession") + " " + modeStyle.Render(m.modeLabel())
@@ -711,12 +740,17 @@ func (m Model) renderFooter() string {
 	case ViewRawPart:
 		toggle := "R raw JSON"
 		if m.rawMode {
-			toggle = "R pretty detail"
+			toggle = "R " + m.rawPrimaryModeLabel()
 		}
 		if m.rawGuard != "" || m.rawContent == "" {
 			toggle = "raw unavailable"
 		}
-		help = fmt.Sprintf("j/k scroll  pgup/pgdown page  %s  h back  / filter  q quit", toggle)
+		fields := []string{"j/k scroll", "pgup/pgdown page", toggle}
+		if m.messageDetail.active && isAssistantRole(m.rawPart.Role) && !m.rawMode {
+			fields = append(fields, m.markdownToggleHelp())
+		}
+		fields = append(fields, "h back", "/ filter", "q quit")
+		help = strings.Join(fields, "  ")
 	default:
 		help = "q quit"
 	}
@@ -1143,12 +1177,16 @@ func (m Model) renderRawPart(height int) string {
 	width := m.safeWidth()
 	kind := firstNonEmpty(string(m.rawPart.Kind), m.rawPart.Type, "part")
 	summary := firstNonEmpty(m.rawPart.ToolName, m.rawPart.Title, m.rawPart.FilePath, m.rawPart.PartID)
+	title := "Part Detail (" + m.rawModeLabel() + ")"
+	if m.messageDetail.active {
+		title = "Message Detail (" + m.rawModeLabel() + ")"
+	}
 	lines := []string{
-		titleStyle.Render(truncatePlain("Part Detail ("+m.rawModeLabel()+")", width)),
+		titleStyle.Render(truncatePlain(title, width)),
 		dimStyle.Render(truncatePlain(fmt.Sprintf("%s  %s  %d bytes", kind, summary, m.rawPart.SizeBytes), width)),
 		dimStyle.Render(truncatePlain("Source: "+firstNonEmpty(m.rawPart.SourcePath, "unknown"), width)),
 	}
-	if m.rawGuard != "" {
+	if m.rawGuard != "" && !m.messageDetail.active {
 		lines = append(lines, warnStyle.Render(truncatePlain(m.rawGuard, width)))
 		return fitBlock(lines, height, width)
 	}
@@ -1160,12 +1198,28 @@ func (m Model) renderRawPart(height int) string {
 	start := clamp(m.rawScroll, 0, maxScroll)
 	lines = append(lines, accentStyle.Render(m.rawContentHeading()))
 	for _, line := range contentLines[start:min(len(contentLines), start+contentHeight)] {
+		if m.messageDetail.active && !m.rawMode && m.messageDetail.renderMarkdown && isAssistantRole(m.rawPart.Role) && m.messageDetail.guard == "" {
+			lines = append(lines, truncateStyled(line, width))
+			continue
+		}
 		lines = append(lines, truncatePlain(line, width))
 	}
 	return fitBlock(lines, height, width)
 }
 
 func (m Model) rawDisplayContent() string {
+	if m.messageDetail.active && !m.rawMode {
+		content := m.messageDetail.sourceContent()
+		if m.rawSearchQuery != "" {
+			content = matchingLines(content, m.rawSearchQuery)
+		}
+		contentWidth := max(12, m.safeWidth())
+		if m.messageDetail.renderMarkdown && isAssistantRole(m.rawPart.Role) && m.messageDetail.guard == "" {
+			part := index.TimelinePart{PartID: m.rawPart.PartID, SourcePath: m.rawPart.SourcePath}
+			return strings.Join(m.cachedMarkdownRows(part, content, contentWidth), "\n")
+		}
+		return strings.Join(wrapText(content, contentWidth), "\n")
+	}
 	content := renderPrettyPartDetail(m.rawPart, m.rawData)
 	if m.rawMode {
 		content = m.rawContent
@@ -1180,12 +1234,31 @@ func (m Model) rawModeLabel() string {
 	if m.rawMode {
 		return "raw"
 	}
+	return m.rawPrimaryModeLabel()
+}
+
+func (m Model) rawPrimaryModeLabel() string {
+	if m.messageDetail.active {
+		if m.messageDetail.renderMarkdown && isAssistantRole(m.rawPart.Role) {
+			return "markdown"
+		}
+		return "source"
+	}
 	return "pretty"
 }
 
 func (m Model) rawContentHeading() string {
 	if m.rawMode {
 		return "Raw JSON"
+	}
+	if m.messageDetail.active {
+		if m.rawSearchQuery != "" {
+			return "Message Detail Matches"
+		}
+		if m.messageDetail.renderMarkdown && isAssistantRole(m.rawPart.Role) {
+			return "Rendered Message"
+		}
+		return "Source Message"
 	}
 	return "Pretty Detail"
 }
@@ -1240,7 +1313,11 @@ func (m Model) nextSessionListModeLabel() string {
 }
 
 func (m Model) markdownToggleHelp() string {
-	if m.renderMarkdown {
+	renderMarkdown := m.renderMarkdown
+	if m.mode == ViewRawPart && m.messageDetail.active {
+		renderMarkdown = m.messageDetail.renderMarkdown
+	}
+	if renderMarkdown {
 		return "m source md"
 	}
 	return "m render md"
@@ -1744,7 +1821,16 @@ func (m Model) partVisible(partIndex int) bool {
 
 func isOpenablePart(part index.TimelinePart) bool {
 	switch part.Kind {
-	case opencode.PartKindTool, opencode.PartKindPatch, opencode.PartKindFile:
+	case opencode.PartKindText, opencode.PartKindReasoning, opencode.PartKindTool, opencode.PartKindPatch, opencode.PartKindFile:
+		return true
+	default:
+		return false
+	}
+}
+
+func isMessageDetailPart(part index.TimelinePart) bool {
+	switch part.Kind {
+	case opencode.PartKindText, opencode.PartKindReasoning:
 		return true
 	default:
 		return false

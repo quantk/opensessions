@@ -828,6 +828,197 @@ func TestTimelineSearchUsesSourceMarkdownText(t *testing.T) {
 	}
 }
 
+func TestUserMessageDetailShowsMoreThanTimelinePreview(t *testing.T) {
+	repo := newFakeRepo(t)
+	tail := "detail-only-user-tail"
+	text := strings.Repeat("A", maxTranscriptRunes+200) + "\nUse `source marker` " + tail
+	raw := fmt.Sprintf(`{"type":"text","text":%q}`, text)
+	part := index.TimelinePart{PartID: "prt_long_user_detail", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Preview: text, IndexText: text, RawJSON: raw, SizeBytes: int64(len(raw))}
+	repo.timelines["ses_project"] = []index.TimelinePart{part}
+
+	preview := displayPartText(part)
+	if !strings.HasSuffix(preview, "...") || strings.Contains(preview, tail) {
+		t.Fatalf("timeline preview should remain bounded and omit tail: len=%d containsTail=%v", len([]rune(preview)), strings.Contains(preview, tail))
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 10})
+	model = sendKey(t, model, "l")
+	model = sendKey(t, model, "enter")
+	model = sendKey(t, model, "G")
+	view := plainView(model.View())
+	if model.mode != ViewRawPart || !model.messageDetail.active || !strings.Contains(view, "Message Detail (source)") {
+		t.Fatalf("user text did not open message detail: mode=%v active=%v\n%s", model.mode, model.messageDetail.active, model.View())
+	}
+	if !strings.Contains(view, tail) || !strings.Contains(view, "`source marker`") {
+		t.Fatalf("message detail should show source tail beyond timeline preview:\n%s", model.View())
+	}
+}
+
+func TestAssistantMessageDetailPreservesMarkdownMode(t *testing.T) {
+	repo := newFakeRepo(t)
+	markdown := "# Plan\n\nUse `go test ./internal/tui`."
+	raw := fmt.Sprintf(`{"type":"text","text":%q}`, markdown)
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_assistant_detail", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindText, Preview: markdown, IndexText: markdown, RawJSON: raw, SizeBytes: int64(len(raw))},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	model = sendKey(t, model, "enter")
+	plain := plainView(model.View())
+	if model.mode != ViewRawPart || !model.messageDetail.renderMarkdown || !strings.Contains(plain, "Message Detail (markdown)") {
+		t.Fatalf("assistant detail should preserve rendered markdown mode: mode=%v render=%v\n%s", model.mode, model.messageDetail.renderMarkdown, model.View())
+	}
+	if strings.Contains(plain, "`go test ./internal/tui`") || !strings.Contains(plain, "go test ./internal/tui") {
+		t.Fatalf("assistant detail should render markdown by default:\n%s", model.View())
+	}
+
+	model = sendKey(t, model, "h")
+	model = sendKey(t, model, "m")
+	model = sendKey(t, model, "enter")
+	plain = plainView(model.View())
+	if model.messageDetail.renderMarkdown || !strings.Contains(plain, "Message Detail (source)") || !strings.Contains(plain, "`go test ./internal/tui`") {
+		t.Fatalf("assistant detail should preserve source markdown mode:\n%s", model.View())
+	}
+}
+
+func TestMessageDetailTruncationMarker(t *testing.T) {
+	repo := newFakeRepo(t)
+	text := strings.Repeat("A", MaxMessageDetailRunes) + "TAIL_AFTER_CAP"
+	raw := fmt.Sprintf(`{"type":"text","text":%q}`, text)
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_truncated_detail", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Preview: "long", IndexText: "long", RawJSON: raw, SizeBytes: int64(len(raw))},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 10})
+	model = sendKey(t, model, "l")
+	model = sendKey(t, model, "enter")
+	model = sendKey(t, model, "G")
+	view := plainView(model.View())
+	if !strings.Contains(view, messageDetailTruncationMarker()) {
+		t.Fatalf("message detail truncation marker missing:\n%s", model.View())
+	}
+	if strings.Contains(view, "TAIL_AFTER_CAP") {
+		t.Fatalf("message detail rendered content beyond cap:\n%s", model.View())
+	}
+}
+
+func TestMessageDetailGuardShowsIndexedPreviewFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		part index.TimelinePart
+	}{
+		{
+			name: "binary raw",
+			part: index.TimelinePart{PartID: "prt_binary_detail", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Binary: true, Preview: "indexed fallback preview", IndexText: "indexed fallback index", RawJSON: `{"type":"text","text":"unsafe full content"}`, SizeBytes: 44},
+		},
+		{
+			name: "too large source",
+			part: index.TimelinePart{PartID: "prt_large_detail", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Preview: "large fallback preview", IndexText: "large fallback index", SourcePath: "/missing/source.json", SizeBytes: MaxRawDisplayBytes + 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newFakeRepo(t)
+			repo.timelines["ses_project"] = []index.TimelinePart{tt.part}
+
+			model := NewModel(repo, repo.sessions)
+			model = sendKey(t, model, "l")
+			model = sendKey(t, model, "enter")
+			plain := plainView(model.View())
+			if model.mode != ViewRawPart || !model.messageDetail.active || !strings.Contains(plain, "Message Detail") {
+				t.Fatalf("guarded part did not open message detail: mode=%v active=%v\n%s", model.mode, model.messageDetail.active, model.View())
+			}
+			if !strings.Contains(plain, "too large") || !strings.Contains(plain, "Indexed Preview") || !strings.Contains(plain, firstNonEmpty(tt.part.IndexText, tt.part.Preview)) {
+				t.Fatalf("guarded detail missing guard/fallback:\n%s", model.View())
+			}
+			if strings.Contains(plain, "unsafe full content") || !strings.Contains(plain, "raw unavailable") {
+				t.Fatalf("guarded detail rendered unsafe raw or allowed raw toggle:\n%s", model.View())
+			}
+		})
+	}
+}
+
+func TestReasoningMessageDetailRespectsVisibility(t *testing.T) {
+	repo := newFakeRepo(t)
+	reasoning := "visible reasoning detail"
+	raw := fmt.Sprintf(`{"type":"reasoning","text":%q}`, reasoning)
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_reasoning_detail", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindReasoning, Preview: reasoning, IndexText: reasoning, RawJSON: raw, SizeBytes: int64(len(raw))},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	if strings.Contains(plainView(model.View()), reasoning) {
+		t.Fatalf("reasoning should be hidden before toggle:\n%s", model.View())
+	}
+	model = sendKey(t, model, "enter")
+	if model.mode != ViewTimeline {
+		t.Fatalf("hidden reasoning should not open, mode=%v", model.mode)
+	}
+
+	model = sendKey(t, model, "r")
+	model = sendKey(t, model, "enter")
+	view := plainView(model.View())
+	if model.mode != ViewRawPart || !model.messageDetail.active || !strings.Contains(view, reasoning) {
+		t.Fatalf("visible reasoning did not open bounded message detail: mode=%v active=%v\n%s", model.mode, model.messageDetail.active, model.View())
+	}
+}
+
+func TestMessageDetailRawToggleAndSearchUseSourceText(t *testing.T) {
+	repo := newFakeRepo(t)
+	markdown := "Use `needle` in source markdown."
+	raw := fmt.Sprintf(`{"type":"text","text":%q}`, markdown)
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_raw_search_detail", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindText, Preview: markdown, IndexText: markdown, RawJSON: raw, SizeBytes: int64(len(raw))},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	model = sendKey(t, model, "enter")
+	if strings.Contains(plainView(model.View()), "`needle`") {
+		t.Fatalf("precondition failed: rendered markdown should hide source backticks:\n%s", model.View())
+	}
+	model = search(t, model, "`needle`")
+	plain := plainView(model.View())
+	if strings.Contains(plain, "No matches") || !strings.Contains(plain, "needle") {
+		t.Fatalf("message detail search should match source/capped text:\n%s", model.View())
+	}
+
+	model = sendKey(t, model, "R")
+	plain = plainView(model.View())
+	if !model.rawMode || !strings.Contains(plain, "Raw JSON") || !strings.Contains(plain, `"text": "Use `) {
+		t.Fatalf("message detail raw toggle should show guarded-safe raw JSON:\n%s", model.View())
+	}
+}
+
+func TestTimelineStillOpensPatchAndFileDetails(t *testing.T) {
+	repo := newFakeRepo(t)
+	patchRaw := `{"type":"patch","title":"Update README","path":"README.md","diff":"@@ -1 +1\n-old\n+new"}`
+	fileRaw := `{"type":"file","mime":"text/plain","filename":"README.md","source":{"type":"file","path":"README.md","text":{"value":"hello docs"}}}`
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_patch_timeline", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindPatch, Title: "Update README", RawJSON: patchRaw, SizeBytes: int64(len(patchRaw))},
+		{PartID: "prt_file_timeline", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindFile, FilePath: "README.md", RawJSON: fileRaw, SizeBytes: int64(len(fileRaw))},
+	}
+	repo.rawParts["prt_patch_timeline"] = index.RawPart{PartID: "prt_patch_timeline", Kind: opencode.PartKindPatch, Title: "Update README", RawJSON: patchRaw, SizeBytes: int64(len(patchRaw))}
+	repo.rawParts["prt_file_timeline"] = index.RawPart{PartID: "prt_file_timeline", Kind: opencode.PartKindFile, FilePath: "README.md", RawJSON: fileRaw, SizeBytes: int64(len(fileRaw))}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	model = sendKey(t, model, "enter")
+	if model.mode != ViewRawPart || model.messageDetail.active || !strings.Contains(plainView(model.View()), "Patch Detail") {
+		t.Fatalf("patch timeline row should still open patch detail:\n%s", model.View())
+	}
+	model = sendKey(t, model, "h")
+	model = sendKey(t, model, "j")
+	model = sendKey(t, model, "enter")
+	if model.mode != ViewRawPart || model.messageDetail.active || !strings.Contains(plainView(model.View()), "File Detail") || !strings.Contains(plainView(model.View()), "hello docs") {
+		t.Fatalf("file timeline row should still open file detail:\n%s", model.View())
+	}
+}
+
 func sendKey(t *testing.T, model Model, key string) Model {
 	t.Helper()
 	updated, cmd := updateModel(t, model, keyMsg(key))
