@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDiscoverStorageRoot(t *testing.T) {
@@ -237,6 +238,53 @@ func TestScanWithMetadataReusesUnchangedPart(t *testing.T) {
 	}
 }
 
+func TestScanWithMetadataReusesUnchangedDatabaseRowsAfterDatabaseMTimeChanges(t *testing.T) {
+	root, dbPath, db := createDatabaseBackedStorage(t)
+	defer db.Close()
+	snapshot, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	metadata := snapshotMetadata(snapshot)
+	existing := snapshot
+	existing.Sessions[0].Messages[0].Parts[0].IndexText = "reused database row sentinel"
+	future := findPart(t, findSession(t, snapshot, "ses_db"), "prt_db_text").Source.ModTime.Add(time.Hour)
+	if err := os.Chtimes(dbPath, future, future); err != nil {
+		t.Fatalf("chtimes database: %v", err)
+	}
+
+	rescanned, err := ScanWithMetadata(root, metadata, existing)
+	if err != nil {
+		t.Fatalf("ScanWithMetadata: %v", err)
+	}
+	part := findPart(t, findSession(t, rescanned, "ses_db"), "prt_db_text")
+	if part.IndexText != "reused database row sentinel" {
+		t.Fatalf("database row was reparsed instead of reused: %#v", part)
+	}
+}
+
+func TestScanWithMetadataRefreshesChangedDatabaseRows(t *testing.T) {
+	root, _, db := createDatabaseBackedStorage(t)
+	defer db.Close()
+	snapshot, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	metadata := snapshotMetadata(snapshot)
+	existing := snapshot
+	existing.Sessions[0].Messages[0].Parts[0].IndexText = "stale sentinel"
+	mustExec(t, db, `UPDATE part SET time_updated = 1777800002000, data = '{"type":"text","text":"changed database row"}' WHERE id = 'prt_db_text'`)
+
+	rescanned, err := ScanWithMetadata(root, metadata, existing)
+	if err != nil {
+		t.Fatalf("ScanWithMetadata changed row: %v", err)
+	}
+	part := findPart(t, findSession(t, rescanned, "ses_db"), "prt_db_text")
+	if !strings.Contains(part.IndexText, "changed database row") || part.IndexText == "stale sentinel" {
+		t.Fatalf("changed database row was not refreshed: %#v", part)
+	}
+}
+
 func TestScanShortCircuitsHeavyPartPayload(t *testing.T) {
 	root := t.TempDir()
 	mustWriteFile(t, filepath.Join(root, "project", "proj.json"), `{"id":"proj","worktree":"/tmp/project"}`)
@@ -306,6 +354,54 @@ func TestScanDoesNotModifyStorage(t *testing.T) {
 	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
 		t.Fatalf("scanner modified storage file: before size=%d mod=%s after size=%d mod=%s", before.Size(), before.ModTime(), after.Size(), after.ModTime())
 	}
+}
+
+func createDatabaseBackedStorage(t *testing.T) (string, string, *sql.DB) {
+	t.Helper()
+	base := t.TempDir()
+	root := filepath.Join(base, "opencode", "storage")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir storage root: %v", err)
+	}
+	dbPath := filepath.Join(base, "opencode", "opencode.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite fixture: %v", err)
+	}
+	mustExec(t, db, `CREATE TABLE project (id text PRIMARY KEY, worktree text NOT NULL, vcs text, time_created integer NOT NULL, time_updated integer NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE session (id text PRIMARY KEY, project_id text NOT NULL, slug text NOT NULL, directory text NOT NULL, title text NOT NULL, version text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`)
+	mustExec(t, db, `CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`)
+	mustExec(t, db, `INSERT INTO project (id, worktree, vcs, time_created, time_updated) VALUES ('proj-db', '/tmp/db-project', 'git', 1777800000000, 1777800000000)`)
+	mustExec(t, db, `INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES ('ses_db', 'proj-db', 'fresh', '/tmp/db-project', 'Fresh database session', '1.2.3', 1777800000000, 1777800100000)`)
+	mustExec(t, db, `INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_db', 'ses_db', 1777800001000, 1777800001000, '{"role":"user"}')`)
+	mustExec(t, db, `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_db_text', 'msg_db', 'ses_db', 1777800001000, 1777800001000, '{"type":"text","text":"database row"}')`)
+	return root, dbPath, db
+}
+
+func snapshotMetadata(snapshot Snapshot) map[string]FileRecord {
+	metadata := map[string]FileRecord{}
+	for _, project := range snapshot.Projects {
+		if project.Source.Path != "" {
+			metadata[project.Source.Path] = project.Source
+		}
+	}
+	for _, session := range snapshot.Sessions {
+		if session.Source.Path != "" {
+			metadata[session.Source.Path] = session.Source
+		}
+		for _, message := range session.Messages {
+			if message.Source.Path != "" {
+				metadata[message.Source.Path] = message.Source
+			}
+			for _, part := range message.Parts {
+				if part.Source.Path != "" {
+					metadata[part.Source.Path] = part.Source
+				}
+			}
+		}
+	}
+	return metadata
 }
 
 func mustExec(t *testing.T, db *sql.DB, query string) {

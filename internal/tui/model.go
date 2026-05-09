@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/quantick/opensession/internal/index"
+	"github.com/quantick/opensession/internal/indexer"
 	"github.com/quantick/opensession/internal/opencode"
 	"github.com/quantick/opensession/internal/source"
 )
@@ -142,6 +143,11 @@ type treeSearchResultMsg struct {
 	err       error
 }
 
+type indexEventMsg struct {
+	event indexer.Event
+	ok    bool
+}
+
 type Repository interface {
 	ListSessions(context.Context) ([]index.SessionSummary, error)
 	Session(context.Context, string) (index.SessionSummary, error)
@@ -193,6 +199,14 @@ type Model struct {
 	messageDetail messageDetailState
 	lastErr       error
 
+	indexEvents      <-chan indexer.Event
+	indexingEnabled  bool
+	indexingActive   bool
+	indexingDone     bool
+	indexingStatus   string
+	indexingErr      string
+	indexingSessions int
+
 	width  int
 	height int
 
@@ -200,33 +214,40 @@ type Model struct {
 	timelineCache    *timelineDisplayCache
 }
 
-var (
-	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("69"))
-	modeStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("183"))
-	accentStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("75"))
-	selectedStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("57"))
-	activeToolStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("58"))
-	userStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
-	assistantStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("111"))
-	toolStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	warnStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-)
-
 var partTextFromRawJSONHook func()
 
 func NewModel(repo Repository, sessions []index.SessionSummary) Model {
+	return newModel(repo, sessions, nil, false, "")
+}
+
+func NewModelWithIndexEvents(repo Repository, sessions []index.SessionSummary, events <-chan indexer.Event, indexingEnabled bool) Model {
+	return newModel(repo, sessions, events, indexingEnabled, "")
+}
+
+func NewModelWithIndexingDisabled(repo Repository, sessions []index.SessionSummary) Model {
+	return newModel(repo, sessions, nil, false, "Index: disabled (--no-scan)")
+}
+
+func newModel(repo Repository, sessions []index.SessionSummary, events <-chan indexer.Event, indexingEnabled bool, status string) Model {
 	sessions = topLevelSessions(sessions)
+	if status == "" && indexingEnabled {
+		status = "Index: waiting to refresh cached sessions"
+	}
 	return Model{
-		repo:            repo,
-		mode:            ViewSessions,
-		sessionListMode: SessionListFlat,
-		sessions:        append([]index.SessionSummary(nil), sessions...),
-		allSessions:     append([]index.SessionSummary(nil), sessions...),
-		renderMarkdown:  true,
-		width:           100,
-		height:          28,
-		timelineCache:   newTimelineDisplayCache(),
+		repo:             repo,
+		mode:             ViewSessions,
+		sessionListMode:  SessionListFlat,
+		sessions:         append([]index.SessionSummary(nil), sessions...),
+		allSessions:      append([]index.SessionSummary(nil), sessions...),
+		renderMarkdown:   true,
+		indexEvents:      events,
+		indexingEnabled:  indexingEnabled,
+		indexingActive:   indexingEnabled && events != nil,
+		indexingStatus:   status,
+		indexingSessions: len(sessions),
+		width:            100,
+		height:           28,
+		timelineCache:    newTimelineDisplayCache(),
 	}
 }
 
@@ -266,7 +287,17 @@ func (m *Model) precomputeTimelineText() {
 }
 
 func (m Model) Init() tea.Cmd {
-	return nil
+	return m.waitIndexEventCmd()
+}
+
+func (m Model) waitIndexEventCmd() tea.Cmd {
+	if m.indexEvents == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		event, ok := <-m.indexEvents
+		return indexEventMsg{event: event, ok: ok}
+	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -293,6 +324,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applyTimelineSearchResult(typed), nil
 	case treeSearchResultMsg:
 		return m.applyTreeSearchResult(typed), nil
+	case indexEventMsg:
+		m = m.applyIndexEvent(typed)
+		if typed.ok {
+			return m, m.waitIndexEventCmd()
+		}
+		return m, nil
 	default:
 		return m, nil
 	}
@@ -498,6 +535,80 @@ func (m Model) applyTimelineSearchResult(msg timelineSearchResultMsg) Model {
 	m.selectedPart = m.firstFocusablePartInViewport()
 	m.lastErr = nil
 	return m
+}
+
+func (m Model) applyIndexEvent(msg indexEventMsg) Model {
+	if !msg.ok {
+		m.indexingActive = false
+		if m.indexingEnabled && m.indexingStatus == "" && !m.indexingDone && m.indexingErr == "" {
+			m.indexingStatus = "Index: refresh stopped"
+		}
+		return m
+	}
+	event := msg.event
+	switch event.Kind {
+	case indexer.EventStarted:
+		m.indexingEnabled = true
+		m.indexingActive = true
+		m.indexingDone = false
+		m.indexingErr = ""
+		m.indexingStatus = "Index: refreshing cached sessions"
+	case indexer.EventPhase:
+		m.indexingEnabled = true
+		m.indexingActive = true
+		m.indexingStatus = formatIndexEventStatus(event)
+	case indexer.EventSessions:
+		m.indexingSessions = len(event.Sessions)
+		m.applyRefreshedSessions(event.Sessions)
+	case indexer.EventComplete:
+		m.indexingActive = false
+		m.indexingDone = true
+		m.indexingErr = ""
+		if len(event.Sessions) > 0 || m.indexingSessions == 0 {
+			m.indexingSessions = len(event.Sessions)
+		}
+		if event.Sessions != nil {
+			m.applyRefreshedSessions(event.Sessions)
+		}
+		m.indexingStatus = fmt.Sprintf("Index: up to date (%d sessions)", m.indexingSessions)
+	case indexer.EventFailed:
+		m.indexingActive = false
+		m.indexingDone = false
+		if event.Err != nil {
+			m.indexingErr = event.Err.Error()
+		} else {
+			m.indexingErr = "unknown indexing error"
+		}
+		m.indexingStatus = "Index: refresh failed"
+	}
+	return m
+}
+
+func (m *Model) applyRefreshedSessions(sessions []index.SessionSummary) {
+	refreshed := topLevelSessions(sessions)
+	selectedID := m.selectedSessionID()
+	fallback := m.selectedSession
+	m.allSessions = append([]index.SessionSummary(nil), refreshed...)
+	if m.mode == ViewSessions && strings.TrimSpace(m.searchQuery) == "" {
+		m.sessions = append([]index.SessionSummary(nil), refreshed...)
+		m.selectSessionByID(selectedID, fallback)
+	}
+}
+
+func formatIndexEventStatus(event indexer.Event) string {
+	fields := []string{"Index:"}
+	if event.Source != "" {
+		fields = append(fields, sourceLabel(string(event.Source)))
+	}
+	phase := strings.TrimSpace(event.Phase)
+	if phase == "" {
+		phase = "refreshing"
+	}
+	fields = append(fields, phase)
+	if event.Total > 0 {
+		fields = append(fields, fmt.Sprintf("%d/%d", event.Current, event.Total))
+	}
+	return strings.Join(fields, " ")
 }
 
 func (m *Model) move(delta int) {
@@ -803,6 +914,13 @@ func (m Model) View() string {
 	if m.searchLoading {
 		sections = append(sections, dimStyle.Render(truncatePlain("Searching...", m.safeWidth())))
 	}
+	if status := m.indexStatusLine(); status != "" {
+		style := dimStyle
+		if m.indexingErr != "" {
+			style = warnStyle
+		}
+		sections = append(sections, style.Render(truncatePlain(status, m.safeWidth())))
+	}
 
 	height := m.height - len(sections) - 1
 	if height < 1 {
@@ -851,6 +969,16 @@ func (m Model) renderSearchPrompt() string {
 	return accentStyle.Render("/") + truncatePlain(query, max(1, m.safeWidth()-1))
 }
 
+func (m Model) indexStatusLine() string {
+	if m.indexingErr != "" {
+		return "Index: refresh failed: " + m.indexingErr
+	}
+	if m.indexingStatus != "" {
+		return m.indexingStatus
+	}
+	return ""
+}
+
 func (m Model) renderFooter() string {
 	var help string
 	switch m.mode {
@@ -887,7 +1015,13 @@ func (m Model) renderFooter() string {
 func (m Model) renderSessions(height int) string {
 	width := m.safeWidth()
 	if len(m.sessions) == 0 {
-		return fitBlock([]string{accentStyle.Render("Sessions"), "No sessions found."}, height, width)
+		lines := []string{accentStyle.Render("Sessions")}
+		if m.indexingActive {
+			lines = append(lines, "No cached sessions yet.", "Indexing is running in the background.")
+		} else {
+			lines = append(lines, "No sessions found.")
+		}
+		return fitBlock(lines, height, width)
 	}
 	if width >= 86 && height >= 8 {
 		return m.renderSessionsWide(height, width)
@@ -934,12 +1068,12 @@ func (m Model) sessionListLines(height, width int) []string {
 		if m.sessionListMode == SessionListGrouped {
 			prefix = "  "
 		}
-		label := marker(i == selectedRow) + prefix + title
-		line := withTail(label, countLabel(session), width)
+		content := withTail(prefix+title, countLabel(session), focusRailContentWidth(width))
+		rowStyle := lipgloss.NewStyle()
 		if i == selectedRow {
-			line = selectedStyle.Render(padPlain(line, width))
+			rowStyle = selectedStyle
 		}
-		lines = append(lines, line)
+		lines = append(lines, renderRailLine(content, width, i == selectedRow, false, rowStyle, i == selectedRow))
 	}
 	return lines
 }
@@ -1040,7 +1174,7 @@ func (m Model) renderSessionTree(height int) string {
 	childCounts := treeChildCounts(m.treeEntries)
 	for i := start; i < end; i++ {
 		entry := m.treeEntries[i]
-		prefix := marker(i == m.selectedTree) + strings.Repeat("  ", min(depths[entry.ID], 8))
+		prefix := strings.Repeat("  ", min(depths[entry.ID], 8))
 		shape := "─"
 		if childCounts[entry.ID] > 1 {
 			shape = "┬"
@@ -1052,11 +1186,12 @@ func (m Model) renderSessionTree(height int) string {
 		if entry.ID == m.activeEntryID {
 			line += "  active"
 		}
-		line = withTail(line, shortID(entry.ID), width)
+		line = withTail(line, shortID(entry.ID), focusRailContentWidth(width))
+		rowStyle := lipgloss.NewStyle()
 		if i == m.selectedTree {
-			line = selectedStyle.Render(padPlain(line, width))
+			rowStyle = selectedStyle
 		}
-		lines = append(lines, line)
+		lines = append(lines, renderRailLine(line, width, i == m.selectedTree, false, rowStyle, i == m.selectedTree))
 	}
 	return fitBlock(lines, height, width)
 }
@@ -1143,7 +1278,7 @@ func (m Model) visibleTimelineRows(layout *timelineLayout, start, end, width int
 			}
 		case timelineLayoutRowPart:
 			if row.partIndex < 0 || row.partIndex >= len(m.timeline) {
-				rows = append(rows, transcriptLine{text: dimStyle.Render(truncatePlain("  [reasoning hidden] r to show", width)), partIndex: -1})
+				rows = append(rows, transcriptLine{text: renderRailLine("[reasoning hidden] r to show", width, false, false, dimStyle, false), partIndex: -1})
 				continue
 			}
 			rowsForPart, ok := partRows[row.partIndex]
@@ -1172,6 +1307,9 @@ func roleHeader(part index.TimelinePart, width int) transcriptLine {
 }
 
 func (m Model) partRows(part index.TimelinePart, partIndex, width int) []transcriptLine {
+	if isLowSignalToolLifecyclePart(part) {
+		return nil
+	}
 	switch part.Kind {
 	case opencode.PartKindText:
 		text := m.cachedDisplayText(part)
@@ -1181,23 +1319,21 @@ func (m Model) partRows(part index.TimelinePart, partIndex, width int) []transcr
 		return bodyTextRows(text, part.Role, width, partIndex, partIndex == m.selectedPart)
 	case opencode.PartKindReasoning:
 		if !m.showReasoning {
-			return []transcriptLine{{text: dimStyle.Render(truncatePlain("  [reasoning hidden] r to show", width)), partIndex: -1}}
+			return []transcriptLine{{text: renderRailLine("[reasoning hidden] r to show", width, false, false, dimStyle, false), partIndex: -1}}
 		}
 		return bodyTextRows(m.cachedDisplayText(part), part.Role, width, partIndex, partIndex == m.selectedPart)
 	case opencode.PartKindTool, opencode.PartKindPatch, opencode.PartKindFile:
-		prefix := "  "
+		focused := partIndex == m.selectedPart
 		style := toolStyle
-		if partIndex == m.selectedPart {
-			prefix = "> "
+		if focused {
 			style = activeToolStyle
 		}
-		line := padPlain(truncatePlain(prefix+compactPart(part), width), width)
-		return []transcriptLine{{text: style.Render(line), partIndex: partIndex}}
+		line := compactPart(part)
+		return []transcriptLine{{text: renderRailLine(line, width, focused, false, style, focused), partIndex: partIndex}}
 	case opencode.PartKindStepStart, opencode.PartKindStepFinish:
 		return nil
 	default:
-		line := truncatePlain("  "+compactPart(part), width)
-		return []transcriptLine{{text: dimStyle.Render(line), partIndex: partIndex}}
+		return []transcriptLine{{text: renderRailLine(compactPart(part), width, partIndex == m.selectedPart, false, dimStyle, false), partIndex: partIndex}}
 	}
 }
 
@@ -1205,14 +1341,10 @@ func (m Model) bodyMarkdownRows(part index.TimelinePart, text string, width int,
 	if text == "" {
 		text = "[empty message]"
 	}
-	markdownRows := m.cachedMarkdownRows(part, text, max(12, width-2))
+	markdownRows := m.cachedMarkdownRows(part, text, max(12, focusRailContentWidth(width)))
 	rows := make([]transcriptLine, 0, len(markdownRows))
-	for _, line := range markdownRows {
-		prefix := "  "
-		if focused {
-			prefix = "> "
-		}
-		rows = append(rows, transcriptLine{text: truncateStyled(prefix+line, width), partIndex: partIndex})
+	for i, line := range markdownRows {
+		rows = append(rows, transcriptLine{text: renderRailStyledLine(line, width, focused, i > 0), partIndex: partIndex})
 	}
 	return rows
 }
@@ -1225,18 +1357,14 @@ func bodyTextRows(text, role string, width int, partIndex int, focused bool) []t
 	if text == "" {
 		text = "[empty message]"
 	}
-	wrapped := wrapText(text, max(12, width-2))
+	wrapped := wrapText(text, max(12, focusRailContentWidth(width)))
 	rows := make([]transcriptLine, 0, len(wrapped))
 	style := roleStyle(role)
 	if focused {
 		style = style.Bold(true)
 	}
-	for _, line := range wrapped {
-		prefix := "  "
-		if focused {
-			prefix = "> "
-		}
-		rows = append(rows, transcriptLine{text: style.Render(truncatePlain(prefix+line, width)), partIndex: partIndex})
+	for i, line := range wrapped {
+		rows = append(rows, transcriptLine{text: renderRailLine(line, width, focused, i > 0, style, false), partIndex: partIndex})
 	}
 	return rows
 }
@@ -1317,10 +1445,10 @@ func compactPart(part index.TimelinePart) string {
 			if part.SubagentName != "" {
 				label = "[subagent:" + part.SubagentName + "]"
 			}
-			fields := nonEmpty([]string{part.Status, part.Preview, "opens " + part.LinkedSessionID})
+			fields := nonEmpty([]string{statusAffordance(part.Status), toolDisplayPreview(part), "opens " + part.LinkedSessionID})
 			return strings.Join(append([]string{label + " " + firstNonEmpty(part.Title, part.LinkedSessionID)}, append(fields, flags...)...), " - ")
 		}
-		fields := nonEmpty([]string{part.Status, part.Title, shortPath(part.FilePath), part.Preview})
+		fields := nonEmpty([]string{statusAffordance(part.Status), part.Title, shortPath(part.FilePath), toolDisplayPreview(part)})
 		return strings.Join(append([]string{"[tool] " + firstNonEmpty(part.ToolName, "tool")}, append(fields, flags...)...), " - ")
 	case opencode.PartKindPatch:
 		fields := nonEmpty([]string{part.Title, shortPath(part.FilePath), part.Preview})
@@ -1332,6 +1460,58 @@ func compactPart(part index.TimelinePart) string {
 		return strings.Join(nonEmpty([]string{"[" + string(part.Kind) + "]", part.Preview}), " ")
 	default:
 		return strings.Join(nonEmpty([]string{"[" + firstNonEmpty(string(part.Kind), "part") + "]", part.Preview}), " ")
+	}
+}
+
+func isLowSignalToolLifecyclePart(part index.TimelinePart) bool {
+	if part.Kind != opencode.PartKindTool || isLinkedTaskPart(part) {
+		return false
+	}
+	tool := strings.ToLower(strings.TrimSpace(part.ToolName))
+	if tool != "read" {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(part.Status))
+	if status != "started" && status != "completed" {
+		return false
+	}
+	return strings.TrimSpace(part.Title) == "" && strings.TrimSpace(part.FilePath) == "" && toolDisplayPreview(part) == "" && len(partFlags(part)) == 0
+}
+
+func toolDisplayPreview(part index.TimelinePart) string {
+	preview := strings.TrimSpace(part.Preview)
+	if preview == "" {
+		return ""
+	}
+	candidates := [][]string{
+		{part.ToolName, part.Status},
+		{part.ToolName, statusAffordance(part.Status)},
+		{part.ToolName, part.Status, part.Title},
+		{part.ToolName, statusAffordance(part.Status), part.Title},
+	}
+	for _, candidate := range candidates {
+		if strings.EqualFold(preview, strings.Join(nonEmpty(candidate), " - ")) {
+			return ""
+		}
+	}
+	return preview
+}
+
+func statusAffordance(status string) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return ""
+	}
+	lower := strings.ToLower(status)
+	switch {
+	case strings.Contains(lower, "complete"), strings.Contains(lower, "success"), lower == "ok":
+		return "✓ " + status
+	case strings.Contains(lower, "fail"), strings.Contains(lower, "error"), strings.Contains(lower, "cancel"):
+		return "✗ " + status
+	case strings.Contains(lower, "run"), strings.Contains(lower, "pend"), strings.Contains(lower, "start"), strings.Contains(lower, "active"):
+		return "… " + status
+	default:
+		return "? " + status
 	}
 }
 
@@ -1372,9 +1552,29 @@ func (m Model) renderRawPart(height int) string {
 			lines = append(lines, truncateStyled(line, width))
 			continue
 		}
+		if !m.messageDetail.active && !m.rawMode {
+			lines = append(lines, renderDetailContentLine(line, width))
+			continue
+		}
 		lines = append(lines, truncatePlain(line, width))
 	}
 	return fitBlock(lines, height, width)
+}
+
+func renderDetailContentLine(line string, width int) string {
+	line = truncatePlain(line, width)
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return line
+	}
+	if !strings.HasPrefix(line, " ") && !strings.Contains(trimmed, ":") {
+		return detailHeadingStyle.Render(line)
+	}
+	if idx := strings.Index(line, ":"); idx > 0 && !strings.HasPrefix(line, "    ") {
+		label := line[:idx+1]
+		return detailLabelStyle.Render(label) + line[idx+1:]
+	}
+	return line
 }
 
 func (m Model) rawDisplayContent() string {
@@ -2045,14 +2245,14 @@ func groupName(session index.SessionSummary) string {
 }
 
 func sourceBadge(sourceKind string) string {
+	label := "[" + source.KindString(sourceKind) + "]"
 	switch source.NormalizeKind(sourceKind) {
 	case source.KindPi:
-		return "[pi]"
+		label = "[pi]"
 	case source.KindOpenCode:
-		return "[opencode]"
-	default:
-		return "[" + source.KindString(sourceKind) + "]"
+		label = "[opencode]"
 	}
+	return sourceBadgeStyle.Render(label)
 }
 
 func sourceLabel(sourceKind string) string {
@@ -2153,11 +2353,34 @@ func topLevelSessions(sessions []index.SessionSummary) []index.SessionSummary {
 	return out
 }
 
-func marker(selected bool) string {
-	if selected {
-		return ">"
+const focusRailWidth = 2
+
+func focusRailContentWidth(width int) int {
+	return max(1, width-focusRailWidth)
+}
+
+func focusRailPrefix(focused, continuation bool) string {
+	if !focused {
+		return strings.Repeat(" ", focusRailWidth)
 	}
-	return " "
+	if continuation {
+		return focusRailQuietStyle.Render("│") + " "
+	}
+	return focusRailStyle.Render("▌") + " "
+}
+
+func renderRailLine(content string, width int, focused, continuation bool, style lipgloss.Style, pad bool) string {
+	contentWidth := focusRailContentWidth(width)
+	content = truncatePlain(content, contentWidth)
+	if pad {
+		content = padPlain(content, contentWidth)
+	}
+	return truncateStyled(focusRailPrefix(focused, continuation)+style.Render(content), width)
+}
+
+func renderRailStyledLine(content string, width int, focused, continuation bool) string {
+	content = truncateStyled(content, focusRailContentWidth(width))
+	return truncateStyled(focusRailPrefix(focused, continuation)+content, width)
 }
 
 func onOff(value bool) string {

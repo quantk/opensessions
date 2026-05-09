@@ -73,23 +73,57 @@ func discoverDatabaseSources(root string) (databaseSources, error) {
 }
 
 func discoverDatabaseIDs(ctx context.Context, db *sql.DB, dbPath string, info fs.FileInfo, table string, out map[string]FileRecord) error {
-	rows, err := db.QueryContext(ctx, `SELECT id FROM `+table)
+	hasUpdated, err := databaseColumnExists(ctx, db, table, "time_updated")
+	if err != nil {
+		return err
+	}
+	hasData, err := databaseColumnExists(ctx, db, table, "data")
+	if err != nil {
+		return err
+	}
+	query := `SELECT id`
+	if hasUpdated {
+		query += `, time_updated`
+	}
+	if hasData {
+		query += `, length(data)`
+	}
+	query += ` FROM ` + table
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("discover database %s IDs: %w", table, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err != nil {
+		var updated int64
+		var size int64
+		dest := []any{&id}
+		if hasUpdated {
+			dest = append(dest, &updated)
+		}
+		if hasData {
+			dest = append(dest, &size)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return fmt.Errorf("discover database %s row: %w", table, err)
 		}
-		out[id] = FileRecord{Path: dbSourcePath(dbPath, table, id), SizeBytes: info.Size(), ModTime: info.ModTime()}
+		out[id] = FileRecord{Path: dbSourcePath(dbPath, table, id), SizeBytes: size, ModTime: databaseRowModTime(updated, info)}
 	}
 	return rows.Err()
 }
 
 func discoverDatabasePartIDs(ctx context.Context, db *sql.DB, dbPath string, info fs.FileInfo, out map[string]FileRecord) error {
-	rows, err := db.QueryContext(ctx, `SELECT id, length(data) FROM part`)
+	hasUpdated, err := databaseColumnExists(ctx, db, "part", "time_updated")
+	if err != nil {
+		return err
+	}
+	query := `SELECT id, length(data)`
+	if hasUpdated {
+		query += `, time_updated`
+	}
+	query += ` FROM part`
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("discover database part IDs: %w", err)
 	}
@@ -97,12 +131,24 @@ func discoverDatabasePartIDs(ctx context.Context, db *sql.DB, dbPath string, inf
 	for rows.Next() {
 		var id string
 		var size int64
-		if err := rows.Scan(&id, &size); err != nil {
+		var updated int64
+		dest := []any{&id, &size}
+		if hasUpdated {
+			dest = append(dest, &updated)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return fmt.Errorf("discover database part row: %w", err)
 		}
-		out[id] = FileRecord{Path: dbSourcePath(dbPath, "part", id), SizeBytes: size, ModTime: info.ModTime()}
+		out[id] = FileRecord{Path: dbSourcePath(dbPath, "part", id), SizeBytes: size, ModTime: databaseRowModTime(updated, info)}
 	}
 	return rows.Err()
+}
+
+func databaseRowModTime(updated int64, info fs.FileInfo) time.Time {
+	if updated > 0 {
+		return unixMilli(updated)
+	}
+	return info.ModTime()
 }
 
 func scanDatabaseForStorageRoot(root string, options scanOptions) ([]Project, []Session, []Message, []Part, error) {

@@ -14,8 +14,76 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	termansi "github.com/charmbracelet/x/ansi"
 	"github.com/quantick/opensession/internal/index"
+	"github.com/quantick/opensession/internal/indexer"
 	"github.com/quantick/opensession/internal/opencode"
 )
+
+func TestIndexingStatusTransitionsAndRefreshesSessions(t *testing.T) {
+	repo := newFakeRepo(t)
+	model := NewModelWithIndexEvents(repo, repo.sessions, nil, true)
+	model, _ = updateModel(t, model, indexEventMsg{event: indexer.Event{Kind: indexer.EventStarted, Phase: "starting"}, ok: true})
+	if !model.indexingActive || !strings.Contains(model.indexingStatus, "refreshing") {
+		t.Fatalf("indexing did not start: active=%v status=%q", model.indexingActive, model.indexingStatus)
+	}
+	model, _ = updateModel(t, model, indexEventMsg{event: indexer.Event{Kind: indexer.EventPhase, Source: "opencode", Phase: "writing index", Current: 2, Total: 3}, ok: true})
+	if !strings.Contains(model.indexingStatus, "opencode writing index 2/3") {
+		t.Fatalf("phase status = %q", model.indexingStatus)
+	}
+	selectedID := model.selectedSessionID()
+	refreshed := []index.SessionSummary{
+		{ID: "ses_new", Title: "New", UpdatedAt: time.Now()},
+		repo.sessions[0],
+		repo.sessions[1],
+	}
+	model, _ = updateModel(t, model, indexEventMsg{event: indexer.Event{Kind: indexer.EventSessions, Sessions: refreshed}, ok: true})
+	if len(model.allSessions) != 3 || len(model.sessions) != 3 {
+		t.Fatalf("sessions not refreshed: visible=%d all=%d", len(model.sessions), len(model.allSessions))
+	}
+	if got := model.selectedSessionID(); got != selectedID {
+		t.Fatalf("selected session = %q, want preserved %q", got, selectedID)
+	}
+	model, _ = updateModel(t, model, indexEventMsg{event: indexer.Event{Kind: indexer.EventComplete, Sessions: refreshed}, ok: true})
+	if model.indexingActive || !model.indexingDone || !strings.Contains(model.indexingStatus, "up to date") {
+		t.Fatalf("complete status active=%v done=%v status=%q", model.indexingActive, model.indexingDone, model.indexingStatus)
+	}
+}
+
+func TestIndexingFailureAndEmptyCacheDisplay(t *testing.T) {
+	repo := newFakeRepo(t)
+	model := NewModelWithIndexEvents(repo, nil, nil, true)
+	model, _ = updateModel(t, model, indexEventMsg{event: indexer.Event{Kind: indexer.EventStarted}, ok: true})
+	plain := termansi.Strip(model.View())
+	if !strings.Contains(plain, "No cached sessions yet") || !strings.Contains(plain, "Indexing is running") {
+		t.Fatalf("empty indexing view missing status:\n%s", plain)
+	}
+	model, _ = updateModel(t, model, indexEventMsg{event: indexer.Event{Kind: indexer.EventFailed, Err: fmt.Errorf("boom")}, ok: true})
+	plain = termansi.Strip(model.View())
+	if !strings.Contains(plain, "Index: refresh failed: boom") {
+		t.Fatalf("failure status missing:\n%s", plain)
+	}
+}
+
+func TestNoScanIndexingStatus(t *testing.T) {
+	repo := newFakeRepo(t)
+	model := NewModelWithIndexingDisabled(repo, repo.sessions)
+	plain := termansi.Strip(model.View())
+	if !strings.Contains(plain, "Index: disabled (--no-scan)") {
+		t.Fatalf("no-scan status missing:\n%s", plain)
+	}
+}
+
+func TestIndexRefreshDoesNotResetTimelineView(t *testing.T) {
+	repo := newFakeRepo(t)
+	model := NewModelWithIndexEvents(repo, repo.sessions, nil, true)
+	model = sendKey(t, model, "l")
+	if model.mode != ViewTimeline {
+		t.Fatalf("mode = %v, want timeline", model.mode)
+	}
+	model, _ = updateModel(t, model, indexEventMsg{event: indexer.Event{Kind: indexer.EventSessions, Sessions: append(repo.sessions, index.SessionSummary{ID: "ses_new", Title: "New"})}, ok: true})
+	if model.mode != ViewTimeline || model.currentSession.ID == "" || len(model.timeline) == 0 {
+		t.Fatalf("refresh reset timeline: mode=%v current=%q timeline=%d", model.mode, model.currentSession.ID, len(model.timeline))
+	}
+}
 
 func TestModelNavigatesSessionsTimelineAndBack(t *testing.T) {
 	repo := newFakeRepo(t)
@@ -560,6 +628,25 @@ func TestTimelineJKScrollsWithinLongFocusedMessage(t *testing.T) {
 	}
 }
 
+func TestFocusedMultilineTimelineUsesRailContinuation(t *testing.T) {
+	repo := newFakeRepo(t)
+	text := "first focused line\nsecond focused line\nthird focused line"
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_multiline", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Preview: text, IndexText: text, RawJSON: fmt.Sprintf(`{"type":"text","text":%q}`, text)},
+	}
+	model := NewModel(repo, repo.sessions)
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 12})
+	model = sendKey(t, model, "l")
+
+	plain := plainView(model.View())
+	if !strings.Contains(plain, "▌ first focused line") || !strings.Contains(plain, "│ second focused line") || !strings.Contains(plain, "│ third focused line") {
+		t.Fatalf("focused multiline message missing rail continuation:\n%s", model.View())
+	}
+	if strings.Contains(plain, "> first focused line") {
+		t.Fatalf("focused multiline message still uses prompt marker:\n%s", model.View())
+	}
+}
+
 func TestTimelineOpensFocusedToolDetails(t *testing.T) {
 	repo := newFakeRepo(t)
 	rawPath := filepath.Join(t.TempDir(), "tool.json")
@@ -582,8 +669,9 @@ func TestTimelineOpensFocusedToolDetails(t *testing.T) {
 	if model.selectedPart != 1 {
 		t.Fatalf("selected part = %d, want tool focus after j", model.selectedPart)
 	}
-	if !strings.Contains(model.View(), "> [tool] bash") {
-		t.Fatalf("focused tool card missing:\n%s", model.View())
+	plain := plainView(model.View())
+	if !strings.Contains(plain, "▌ [tool] bash") || strings.Contains(plain, "> [tool] bash") || !strings.Contains(plain, "✓ completed") {
+		t.Fatalf("focused tool card missing rail/status affordance:\n%s", model.View())
 	}
 
 	model = sendKey(t, model, "enter")
@@ -613,8 +701,8 @@ func TestLinkedTaskOpensChildTimelineAndBackRestoresParent(t *testing.T) {
 	model := NewModel(repo, repo.sessions)
 	model = sendKey(t, model, "l")
 	model = sendKey(t, model, "j")
-	if !strings.Contains(plainView(model.View()), "> [subagent:explore] Research dependency") {
-		t.Fatalf("linked task row missing subagent affordance:\n%s", model.View())
+	if plain := plainView(model.View()); !strings.Contains(plain, "▌ [subagent:explore] Research dependency") || strings.Contains(plain, "> [subagent:explore]") {
+		t.Fatalf("linked task row missing rail/subagent affordance:\n%s", model.View())
 	}
 	model = sendKey(t, model, "enter")
 	view := plainView(model.View())
@@ -756,6 +844,26 @@ func TestPrettyDetailRendersGenericToolPatchAndFile(t *testing.T) {
 	view = model.View()
 	if !strings.Contains(view, "File Detail") || !strings.Contains(view, "MIME: text/plain") || !strings.Contains(view, "Filename: README.md") || !strings.Contains(view, "hello docs") {
 		t.Fatalf("file detail missing expected fields:\n%s", view)
+	}
+}
+
+func TestTimelineHidesLowSignalReadLifecycleParts(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_text", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Preview: "hello", IndexText: "hello"},
+		{PartID: "prt_read_started", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "read", Status: "started", Preview: "read - started"},
+		{PartID: "prt_read_completed", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "read", Status: "completed", Preview: "read - completed"},
+		{PartID: "prt_bash_completed", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "bash", Status: "completed", Preview: "go test ./..."},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model = sendKey(t, model, "l")
+	plain := plainView(model.View())
+	if strings.Contains(plain, "read - started") || strings.Contains(plain, "read - completed") || strings.Contains(plain, "[tool] read") {
+		t.Fatalf("low-signal read lifecycle parts should not render:\n%s", model.View())
+	}
+	if !strings.Contains(plain, "[tool] bash") || !strings.Contains(plain, "go test ./...") {
+		t.Fatalf("useful tool row should still render:\n%s", model.View())
 	}
 }
 

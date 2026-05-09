@@ -9,9 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/quantick/opensession/internal/config"
 	"github.com/quantick/opensession/internal/index"
-	"github.com/quantick/opensession/internal/opencode"
-	"github.com/quantick/opensession/internal/pi"
-	"github.com/quantick/opensession/internal/source"
+	"github.com/quantick/opensession/internal/indexer"
 	"github.com/quantick/opensession/internal/tui"
 )
 
@@ -57,80 +55,41 @@ func run(args []string) error {
 	}
 	defer store.Close()
 
-	ctx := context.Background()
-	if !cfg.NoScan {
-		if sourceEnabled(cfg.Sources, source.KindOpenCode) {
-			paths, err := opencode.DiscoverSourcePaths(cfg.OpenCodeRoot)
-			if err != nil {
-				if !os.IsNotExist(err) {
-					return err
-				}
-			} else {
-				metadata, err := store.ScanMetadataBatch(ctx, paths)
-				if err != nil {
-					return err
-				}
-				existing, err := store.Snapshot(ctx)
-				if err != nil {
-					return err
-				}
-				snapshot, err := opencode.ScanWithMetadata(cfg.OpenCodeRoot, opencodeMetadata(metadata), existing)
-				if err != nil {
-					return err
-				}
-				if err := store.UpsertSnapshot(ctx, snapshot); err != nil {
-					return err
-				}
-			}
-		}
-		if sourceEnabled(cfg.Sources, source.KindPi) {
-			paths, err := pi.DiscoverSourcePaths(cfg.PiSessionsRoot)
-			if err != nil {
-				if !os.IsNotExist(err) {
-					return err
-				}
-			} else {
-				metadata, err := store.ScanMetadataBatch(ctx, paths)
-				if err != nil {
-					return err
-				}
-				existing, err := store.Snapshot(ctx)
-				if err != nil {
-					return err
-				}
-				snapshot, err := pi.ScanWithMetadata(cfg.PiSessionsRoot, opencodeMetadata(metadata), existing)
-				if err != nil {
-					return err
-				}
-				if err := store.UpsertSnapshot(ctx, snapshot); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	sessions, err := store.ListSessions(ctx)
 	if err != nil {
 		return err
 	}
-	program := tea.NewProgram(tui.NewModel(store, sessions), tea.WithAltScreen())
+
+	var events <-chan indexer.Event
+	var refreshDone <-chan struct{}
+	if !cfg.NoScan {
+		eventCh := make(chan indexer.Event, 16)
+		doneCh := make(chan struct{})
+		events = eventCh
+		refreshDone = doneCh
+		go func() {
+			defer close(doneCh)
+			defer close(eventCh)
+			_ = indexer.Run(ctx, store, indexer.Options{OpenCodeRoot: cfg.OpenCodeRoot, PiSessionsRoot: cfg.PiSessionsRoot, Sources: cfg.Sources}, func(event indexer.Event) {
+				select {
+				case eventCh <- event:
+				case <-ctx.Done():
+				}
+			})
+		}()
+	}
+
+	model := tui.NewModelWithIndexEvents(store, sessions, events, !cfg.NoScan)
+	if cfg.NoScan {
+		model = tui.NewModelWithIndexingDisabled(store, sessions)
+	}
+	program := tea.NewProgram(model, tea.WithAltScreen())
 	_, err = program.Run()
+	cancel()
+	if refreshDone != nil {
+		<-refreshDone
+	}
 	return err
-}
-
-func sourceEnabled(sources []source.Kind, kind source.Kind) bool {
-	for _, sourceKind := range sources {
-		if sourceKind == kind {
-			return true
-		}
-	}
-	return false
-}
-
-func opencodeMetadata(metadata map[string]index.ScanMetadata) map[string]opencode.FileRecord {
-	out := make(map[string]opencode.FileRecord, len(metadata))
-	for path, record := range metadata {
-		out[path] = opencode.FileRecord{Path: record.Path, SizeBytes: record.SizeBytes, ModTime: record.ModTime}
-	}
-	return out
 }
