@@ -13,7 +13,10 @@ import (
 	"github.com/quantick/opensession/internal/opencode"
 )
 
-const maxDetailPreviewRunes = 4000
+const (
+	maxDetailPreviewRunes    = 4000
+	maxToolOutputDetailRunes = MaxMessageDetailRunes
+)
 
 type toolDetail struct {
 	Name        string
@@ -216,7 +219,7 @@ func renderBashToolDetail(raw index.RawPart, tool toolDetail) string {
 	lines = appendField(lines, "Description", tool.Description)
 	lines = appendField(lines, "Workdir", stringValue(tool.Input, "workdir"))
 	lines = appendTextSection(lines, "Command", firstNonEmpty(stringValue(tool.Input, "command"), raw.Preview))
-	lines = appendTextSection(lines, "Output", safeDetailText(tool.Output))
+	lines = appendTextSection(lines, "Output", safeToolOutputText(tool.Output))
 	lines = appendMapSection(lines, "Metadata", tool.Metadata, nil)
 	return strings.Join(lines, "\n")
 }
@@ -224,7 +227,7 @@ func renderBashToolDetail(raw index.RawPart, tool toolDetail) string {
 func renderSearchToolDetail(raw index.RawPart, tool toolDetail) string {
 	lines := baseToolLines("Search Detail", raw, tool)
 	lines = appendMapSection(lines, "Search Input", tool.Input, []string{"pattern", "query", "path", "include", "glob", "root", "limit"})
-	lines = appendTextSection(lines, "Results", safeDetailText(tool.Output))
+	lines = appendTextSection(lines, "Results", safeToolOutputText(tool.Output))
 	lines = appendMapSection(lines, "Metadata", tool.Metadata, nil)
 	return strings.Join(lines, "\n")
 }
@@ -234,7 +237,7 @@ func renderFileToolDetail(raw index.RawPart, tool toolDetail) string {
 	lines = appendMapSection(lines, "Target", tool.Input, []string{"filePath", "filepath", "path", "file", "offset", "limit", "start", "end"})
 	lines = appendTextSection(lines, "Patch", firstNonEmpty(safeDetailText(valueAt(tool.Input, "patchText")), safeDetailText(valueAt(tool.Input, "patch")), safeDetailText(valueAt(tool.Input, "diff"))))
 	lines = appendTextSection(lines, "Content Preview", firstNonEmpty(safeDetailText(valueAt(tool.Input, "content")), safeDetailText(valueAt(tool.Input, "text")), safeDetailText(valueAt(tool.Input, "old_string")), safeDetailText(valueAt(tool.Input, "new_string"))))
-	lines = appendTextSection(lines, "Output", safeDetailText(tool.Output))
+	lines = appendTextSection(lines, "Output", safeToolOutputText(tool.Output))
 	lines = appendMapSection(lines, "Metadata", tool.Metadata, nil)
 	return strings.Join(lines, "\n")
 }
@@ -243,7 +246,7 @@ func renderGenericToolDetail(raw index.RawPart, tool toolDetail) string {
 	lines := baseToolLines("Tool Detail", raw, tool)
 	lines = appendField(lines, "Description", tool.Description)
 	lines = appendMapSection(lines, "Input", tool.Input, []string{"command", "description", "path", "file", "pattern", "query"})
-	lines = appendTextSection(lines, "Output", safeDetailText(tool.Output))
+	lines = appendTextSection(lines, "Output", safeToolOutputText(tool.Output))
 	lines = appendMapSection(lines, "Metadata", tool.Metadata, nil)
 	return strings.Join(lines, "\n")
 }
@@ -276,7 +279,7 @@ func renderFileDetail(raw index.RawPart, data map[string]any) string {
 func baseToolLines(title string, raw index.RawPart, tool toolDetail) []string {
 	lines := baseDetailLines(title, raw)
 	lines = appendField(lines, "Tool", firstNonEmpty(tool.Name, "tool"))
-	lines = appendField(lines, "Status", tool.Status)
+	lines = appendField(lines, "Status", statusAffordance(tool.Status))
 	lines = appendField(lines, "Title", tool.Title)
 	lines = appendField(lines, "Summary", firstNonEmpty(raw.Preview, raw.IndexText))
 	return lines
@@ -355,7 +358,22 @@ func orderedKeys(data map[string]any, preferred []string) []string {
 }
 
 func safeDetailText(value any) string {
-	text := strings.TrimSpace(detailValueString(value))
+	return safeDetailTextFromString(detailValueString(value))
+}
+
+func safeToolOutputText(value any) string {
+	if text, ok := textLikeDetailValue(value); ok {
+		return safeDetailTextFromStringLimit(text, maxToolOutputDetailRunes)
+	}
+	return safeDetailText(value)
+}
+
+func safeDetailTextFromString(value string) string {
+	return safeDetailTextFromStringLimit(value, maxDetailPreviewRunes)
+}
+
+func safeDetailTextFromStringLimit(value string, maxRunes int) string {
+	text := strings.TrimSpace(value)
 	if text == "" {
 		return ""
 	}
@@ -366,7 +384,42 @@ func safeDetailText(value any) string {
 	if strings.ContainsRune(text, '\x00') {
 		return ""
 	}
-	return truncateRunes(text, maxDetailPreviewRunes)
+	return truncateRunes(text, maxRunes)
+}
+
+func textLikeDetailValue(value any) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		return typed, true
+	case map[string]any:
+		if text, ok := typed["text"].(string); ok {
+			return text, true
+		}
+		if content, ok := textLikeDetailValue(typed["content"]); ok {
+			return content, true
+		}
+	case []any:
+		var texts []string
+		for _, item := range typed {
+			switch block := item.(type) {
+			case string:
+				texts = append(texts, block)
+			case map[string]any:
+				text, ok := block["text"].(string)
+				if !ok {
+					return "", false
+				}
+				texts = append(texts, text)
+			default:
+				return "", false
+			}
+		}
+		if len(texts) == 0 {
+			return "", false
+		}
+		return strings.Join(texts, "\n"), true
+	}
+	return "", false
 }
 
 func singleLinePreview(value string) string {

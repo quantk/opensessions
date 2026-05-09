@@ -2,8 +2,11 @@ package index
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 )
+
+const currentPiIndexVersion = "2"
 
 func (s *Store) initSchema(ctx context.Context) error {
 	statements := []string{
@@ -113,6 +116,10 @@ func (s *Store) initSchema(ctx context.Context) error {
   size_bytes INTEGER NOT NULL,
   mod_time INTEGER NOT NULL
 )`,
+		`CREATE TABLE IF NOT EXISTS app_metadata (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)`,
 		`CREATE TABLE IF NOT EXISTS tags (
   session_id TEXT NOT NULL,
   source_kind TEXT NOT NULL DEFAULT 'opencode',
@@ -206,6 +213,9 @@ func (s *Store) initSchema(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.migratePiScanMetadataVersion(ctx); err != nil {
+		return err
+	}
 	for _, statement := range []string{
 		`CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_source_kind ON sessions(source_kind, updated_at)`,
@@ -217,6 +227,23 @@ func (s *Store) initSchema(ctx context.Context) error {
 	} {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("initialize schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) migratePiScanMetadataVersion(ctx context.Context) error {
+	var stored string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM app_metadata WHERE key = 'pi_index_version'`).Scan(&stored)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("read Pi index version: %w", err)
+	}
+	if err == sql.ErrNoRows || stored != currentPiIndexVersion {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM scan_metadata WHERE source_kind = 'pi'`); err != nil {
+			return fmt.Errorf("invalidate Pi scan metadata: %w", err)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO app_metadata (key, value) VALUES ('pi_index_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, currentPiIndexVersion); err != nil {
+			return fmt.Errorf("store Pi index version: %w", err)
 		}
 	}
 	return nil

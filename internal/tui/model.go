@@ -1541,8 +1541,7 @@ func (m Model) renderRawPart(height int) string {
 		return fitBlock(lines, height, width)
 	}
 
-	content := m.rawDisplayContent()
-	contentLines := splitLines(content)
+	contentLines := m.rawDisplayLines()
 	contentHeight := max(1, height-len(lines)-1)
 	maxScroll := max(0, len(contentLines)-contentHeight)
 	start := clamp(m.rawScroll, 0, maxScroll)
@@ -1575,6 +1574,14 @@ func renderDetailContentLine(line string, width int) string {
 		return detailLabelStyle.Render(label) + line[idx+1:]
 	}
 	return line
+}
+
+func (m Model) rawDisplayLines() []string {
+	content := m.rawDisplayContent()
+	if m.messageDetail.active || m.rawMode {
+		return splitLines(content)
+	}
+	return wrapText(content, m.safeWidth())
 }
 
 func (m Model) rawDisplayContent() string {
@@ -2040,7 +2047,7 @@ func (m Model) rawContentHeight() int {
 }
 
 func (m Model) maxRawScroll() int {
-	return max(0, len(splitLines(m.rawDisplayContent()))-m.rawContentHeight())
+	return max(0, len(m.rawDisplayLines())-m.rawContentHeight())
 }
 
 func (m *Model) moveTimelineFocus(delta int) {

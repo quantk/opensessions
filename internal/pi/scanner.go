@@ -316,6 +316,16 @@ func partsFromAgentMessage(sessionID, entryID, role string, msg map[string]any, 
 			part.Status = "completed"
 		}
 		part.ToolName = firstNonEmpty(part.ToolName, "toolResult")
+		if part.RawJSON == "" {
+			part.RawJSON, _ = boundedRaw(map[string]any{
+				"role":          "toolResult",
+				"toolCallId":    stringValue(msg, "toolCallId"),
+				"toolName":      part.ToolName,
+				"isError":       msg["isError"],
+				"outputPreview": part.Preview,
+				"skippedRaw":    part.SkippedRaw,
+			})
+		}
 		return []opencode.Part{part}
 	case "bashExecution":
 		command := stringValue(msg, "command")
@@ -504,10 +514,13 @@ func mergeToolResults(messages []opencode.Message) {
 			callPart.Status = firstNonEmpty(part.Status, "completed")
 			callPart.IndexText = normalizeSpace(strings.Join(nonEmpty([]string{callPart.IndexText, part.IndexText, part.Preview}), " "))
 			callPart.UpdatedAt = maxTime(callPart.UpdatedAt, part.UpdatedAt)
+			callPart.Heavy = callPart.Heavy || part.Heavy
+			callPart.Binary = callPart.Binary || part.Binary
+			callPart.SkippedRaw = callPart.SkippedRaw || part.SkippedRaw
 			if callPart.Preview == "" || callPart.Preview == "{}" {
 				callPart.Preview = part.Preview
 			}
-			if mergedRaw, ok := mergedToolRaw(call.data, result, callPart); ok {
+			if mergedRaw, ok := mergedToolRaw(call.data, result, callPart, part); ok {
 				callPart.RawJSON = mergedRaw
 			}
 		}
@@ -528,19 +541,25 @@ func rawJSONMap(raw string) map[string]any {
 	return data
 }
 
-func mergedToolRaw(call, result map[string]any, part *opencode.Part) (string, bool) {
+func mergedToolRaw(call, result map[string]any, callPart *opencode.Part, resultPart opencode.Part) (string, bool) {
 	if call == nil || result == nil {
 		return "", false
 	}
 	merged := map[string]any{
 		"type":       "tool",
-		"tool":       firstNonEmpty(stringValue(call, "name"), part.ToolName),
-		"status":     firstNonEmpty(part.Status, "completed"),
+		"tool":       firstNonEmpty(stringValue(call, "name"), callPart.ToolName),
+		"status":     firstNonEmpty(callPart.Status, "completed"),
 		"toolCallId": stringValue(result, "toolCallId"),
 		"input":      call["arguments"],
 		"output":     result["content"],
 		"isError":    result["isError"],
 	}
+	if raw, ok := boundedRaw(merged); ok {
+		return raw, true
+	}
+	merged["output"] = nil
+	merged["outputPreview"] = firstNonEmpty(stringValue(result, "outputPreview"), resultPart.Preview)
+	merged["skippedRaw"] = true
 	return boundedRaw(merged)
 }
 

@@ -146,6 +146,54 @@ func TestStoreUpsertsSearchTagsBookmarksAndScanMetadata(t *testing.T) {
 	}
 }
 
+func TestOpenInvalidatesOldPiScanMetadataOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "opensession.sqlite")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	piPath := filepath.Join(t.TempDir(), "pi.jsonl")
+	opencodePath := filepath.Join(t.TempDir(), "part.json")
+	if err := store.UpsertScanMetadataForSource(ctx, string(source.KindPi), piPath, 10, time.Unix(1, 0)); err != nil {
+		t.Fatalf("UpsertScanMetadataForSource pi: %v", err)
+	}
+	if err := store.UpsertScanMetadataForSource(ctx, string(source.KindOpenCode), opencodePath, 11, time.Unix(2, 0)); err != nil {
+		t.Fatalf("UpsertScanMetadataForSource opencode: %v", err)
+	}
+	mustExec(t, store.db, `UPDATE app_metadata SET value = '1' WHERE key = 'pi_index_version'`)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer store.Close()
+	if _, ok, err := store.ScanMetadata(ctx, piPath); err != nil || ok {
+		t.Fatalf("old Pi metadata should be invalidated, ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.ScanMetadata(ctx, opencodePath); err != nil || !ok {
+		t.Fatalf("OpenCode metadata should be preserved, ok=%v err=%v", ok, err)
+	}
+	if err := store.UpsertScanMetadataForSource(ctx, string(source.KindPi), piPath, 12, time.Unix(3, 0)); err != nil {
+		t.Fatalf("UpsertScanMetadataForSource pi current: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close current: %v", err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen current: %v", err)
+	}
+	defer store.Close()
+	if _, ok, err := store.ScanMetadata(ctx, piPath); err != nil || !ok {
+		t.Fatalf("current Pi metadata should be preserved, ok=%v err=%v", ok, err)
+	}
+}
+
 func TestStoreMigratesPreSourceDatabaseAsOpenCode(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "opensession.sqlite")
@@ -391,6 +439,76 @@ func TestStoreIndexesPiBranchesAndRefreshesChangedFiles(t *testing.T) {
 	}
 }
 
+func TestStorePreservesUnchangedPiSiblingTimelineDuringIncrementalRefresh(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(":memory:")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	root := t.TempDir()
+	base := time.Date(2026, 5, 9, 10, 0, 0, 0, time.UTC)
+	pathA := filepath.Join(root, "project", "a.jsonl")
+	pathB := filepath.Join(root, "project", "b.jsonl")
+	writePiJSONL(t, pathA, []string{
+		`{"type":"session","id":"a","timestamp":"2026-05-09T10:00:00Z","cwd":"/tmp/shared"}`,
+		`{"type":"message","id":"a-u1","parentId":null,"timestamp":"2026-05-09T10:00:01Z","message":{"role":"user","content":"session A keep"}}`,
+	})
+	writePiJSONL(t, pathB, []string{
+		`{"type":"session","id":"b","timestamp":"2026-05-09T10:00:00Z","cwd":"/tmp/shared"}`,
+		`{"type":"message","id":"b-u1","parentId":null,"timestamp":"2026-05-09T10:00:01Z","message":{"role":"user","content":"session B old"}}`,
+	})
+	if err := os.Chtimes(pathA, base, base); err != nil {
+		t.Fatalf("chtimes A: %v", err)
+	}
+	if err := os.Chtimes(pathB, base, base); err != nil {
+		t.Fatalf("chtimes B: %v", err)
+	}
+
+	first, err := pi.Scan(root)
+	if err != nil {
+		t.Fatalf("pi.Scan first: %v", err)
+	}
+	if err := store.UpsertSnapshot(ctx, first); err != nil {
+		t.Fatalf("UpsertSnapshot first: %v", err)
+	}
+	assertPiTimelineContains(t, store, "pi:a", "session A keep")
+	assertPiTimelineContains(t, store, "pi:b", "session B old")
+
+	changedTime := base.Add(time.Hour)
+	writePiJSONL(t, pathB, []string{
+		`{"type":"session","id":"b","timestamp":"2026-05-09T11:00:00Z","cwd":"/tmp/shared"}`,
+		`{"type":"message","id":"b-u1","parentId":null,"timestamp":"2026-05-09T11:00:01Z","message":{"role":"user","content":"session B new"}}`,
+	})
+	if err := os.Chtimes(pathB, changedTime, changedTime); err != nil {
+		t.Fatalf("chtimes changed B: %v", err)
+	}
+
+	paths, err := pi.DiscoverSourcePaths(root)
+	if err != nil {
+		t.Fatalf("DiscoverSourcePaths: %v", err)
+	}
+	metadata, err := store.ScanMetadataBatch(ctx, paths)
+	if err != nil {
+		t.Fatalf("ScanMetadataBatch: %v", err)
+	}
+	existing, err := store.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	incremental, err := pi.ScanWithMetadata(root, opencodeMetadataFromScanMetadata(metadata), existing)
+	if err != nil {
+		t.Fatalf("pi.ScanWithMetadata: %v", err)
+	}
+	if err := store.UpsertSnapshot(ctx, incremental); err != nil {
+		t.Fatalf("UpsertSnapshot incremental: %v", err)
+	}
+
+	assertPiTimelineContains(t, store, "pi:a", "session A keep")
+	assertPiTimelineContains(t, store, "pi:b", "session B new")
+}
+
 func TestStoreBatchScanMetadataAndIncrementalUpsert(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(":memory:")
@@ -605,6 +723,25 @@ func containsTimelineText(parts []TimelinePart, text string) bool {
 		}
 	}
 	return false
+}
+
+func assertPiTimelineContains(t *testing.T, store *Store, sessionID, text string) {
+	t.Helper()
+	timeline, err := store.SessionTimeline(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("SessionTimeline %s: %v", sessionID, err)
+	}
+	if !containsTimelineText(timeline, text) {
+		t.Fatalf("timeline %s = %#v, want text %q", sessionID, timeline, text)
+	}
+}
+
+func opencodeMetadataFromScanMetadata(metadata map[string]ScanMetadata) map[string]opencode.FileRecord {
+	out := make(map[string]opencode.FileRecord, len(metadata))
+	for path, record := range metadata {
+		out[path] = opencode.FileRecord{Path: record.Path, SizeBytes: record.SizeBytes, ModTime: record.ModTime}
+	}
+	return out
 }
 
 func treeLabel(entries []SessionTreeEntry, id string) string {

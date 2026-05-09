@@ -3,6 +3,7 @@ package pi
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -67,6 +68,53 @@ func TestScanParsesLinearAndBranchedPiSessions(t *testing.T) {
 	bash := findMessage(t, session, "pi:pi-session:bash1")
 	if part := findToolPart(bash, "bash"); part == nil || !strings.Contains(part.IndexText, "go test") {
 		t.Fatalf("bash part = %#v", bash.Parts)
+	}
+}
+
+func TestScanMergesHeavyToolResultWithoutSeparateLifecyclePart(t *testing.T) {
+	root := t.TempDir()
+	sessionPath := filepath.Join(root, "project", "heavy-tool.jsonl")
+	heavyOutput := strings.Repeat("read output line\n", 5000)
+	mustWritePiSession(t, sessionPath, []string{
+		`{"type":"session","id":"heavy-tool","timestamp":"2026-05-09T10:00:00Z","cwd":"/tmp/project"}`,
+		`{"type":"message","id":"a1","parentId":null,"timestamp":"2026-05-09T10:00:01Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-heavy","name":"read","arguments":{"path":"large.txt"}}]}}`,
+		`{"type":"message","id":"tr1","parentId":"a1","timestamp":"2026-05-09T10:00:02Z","message":{"role":"toolResult","toolCallId":"call-heavy","toolName":"read","content":[{"type":"text","text":` + strconv.Quote(heavyOutput) + `}],"isError":false}}`,
+	})
+
+	snapshot, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	session := snapshot.Sessions[0]
+	assistant := findMessage(t, session, "pi:heavy-tool:a1")
+	readTool := findToolPart(assistant, "read")
+	if readTool == nil {
+		t.Fatalf("read tool not found: %#v", assistant.Parts)
+	}
+	if readTool.Status != "completed" || !readTool.Heavy || !readTool.SkippedRaw || !strings.Contains(readTool.IndexText, "read output line") {
+		t.Fatalf("merged heavy read tool = %#v", readTool)
+	}
+	result := findMessage(t, session, "pi:heavy-tool:tr1")
+	if len(result.Parts) != 0 {
+		t.Fatalf("matched heavy tool result should not render separately: %#v", result.Parts)
+	}
+}
+
+func TestScanKeepsUnmatchedToolResultStandalone(t *testing.T) {
+	root := t.TempDir()
+	sessionPath := filepath.Join(root, "project", "unmatched-tool.jsonl")
+	mustWritePiSession(t, sessionPath, []string{
+		`{"type":"session","id":"unmatched-tool","timestamp":"2026-05-09T10:00:00Z","cwd":"/tmp/project"}`,
+		`{"type":"message","id":"tr1","parentId":null,"timestamp":"2026-05-09T10:00:01Z","message":{"role":"toolResult","toolCallId":"missing","toolName":"read","content":[{"type":"text","text":"standalone output"}],"isError":false}}`,
+	})
+
+	snapshot, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	result := findMessage(t, snapshot.Sessions[0], "pi:unmatched-tool:tr1")
+	if len(result.Parts) != 1 || result.Parts[0].Type != "tool_result" || result.Parts[0].Status != "completed" || !strings.Contains(result.Parts[0].Preview, "standalone output") {
+		t.Fatalf("unmatched tool result = %#v", result.Parts)
 	}
 }
 

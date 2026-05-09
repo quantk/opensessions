@@ -1036,7 +1036,8 @@ func dirtySessionIDs(snapshot opencode.Snapshot, metadata map[string]ScanMetadat
 		}
 	}
 	for _, session := range snapshot.Sessions {
-		if dirtyProjects[session.ProjectID] || !sourceUnchanged(session.Source, metadata) {
+		projectDirty := dirtyProjects[session.ProjectID] && source.NormalizeKind(session.SourceKind) != source.KindPi
+		if projectDirty || !sourceUnchanged(session.Source, metadata) {
 			dirty[session.ID] = true
 		}
 		for _, message := range session.Messages {

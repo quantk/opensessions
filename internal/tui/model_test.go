@@ -822,9 +822,19 @@ func TestRawPartToggleShowsRawJSON(t *testing.T) {
 func TestPrettyDetailRendersGenericToolPatchAndFile(t *testing.T) {
 	repo := newFakeRepo(t)
 	unknownRaw := `{"type":"tool","tool":"custom_lookup","state":{"status":"failed","input":{"query":"needle","path":"src"},"output":{"error":"not found"},"metadata":{"duration":"1s"}}}`
+	structuredOutputRaw := `{"type":"tool","tool":"read","state":{"status":"completed","input":{"path":"README.md"},"output":[{"type":"text","text":"first line"},{"type":"text","text":"second line"}]}}`
+	longOutputTail := "long-read-output-tail"
+	longOutput := strings.Repeat("long detail output line\n", 300) + longOutputTail
+	longLineOutputTail := "long-line-output-tail"
+	longLineOutput := strings.Repeat("0123456789", 80) + longLineOutputTail
+	longOutputRaw := fmt.Sprintf(`{"type":"tool","tool":"read","state":{"status":"completed","input":{"path":"LONG.md"},"output":[{"type":"text","text":%q}]}}`, longOutput)
+	longLineOutputRaw := fmt.Sprintf(`{"type":"tool","tool":"read","state":{"status":"completed","input":{"path":"LONG-LINE.md"},"output":[{"type":"text","text":%q}]}}`, longLineOutput)
 	patchRaw := `{"type":"patch","title":"Update README","path":"README.md","diff":"@@ -1 +1\n-old\n+new"}`
 	fileRaw := `{"type":"file","mime":"text/plain","filename":"README.md","source":{"type":"file","path":"README.md","text":{"value":"hello docs","start":1,"end":2}}}`
 	repo.rawParts["prt_unknown"] = index.RawPart{PartID: "prt_unknown", Kind: opencode.PartKindTool, ToolName: "custom_lookup", Status: "failed", RawJSON: unknownRaw, SizeBytes: int64(len(unknownRaw))}
+	repo.rawParts["prt_structured_output"] = index.RawPart{PartID: "prt_structured_output", Kind: opencode.PartKindTool, ToolName: "read", Status: "completed", RawJSON: structuredOutputRaw, SizeBytes: int64(len(structuredOutputRaw))}
+	repo.rawParts["prt_long_read_output"] = index.RawPart{PartID: "prt_long_read_output", Kind: opencode.PartKindTool, ToolName: "read", Status: "completed", RawJSON: longOutputRaw, SizeBytes: int64(len(longOutputRaw))}
+	repo.rawParts["prt_long_line_read_output"] = index.RawPart{PartID: "prt_long_line_read_output", Kind: opencode.PartKindTool, ToolName: "read", Status: "completed", RawJSON: longLineOutputRaw, SizeBytes: int64(len(longLineOutputRaw))}
 	repo.rawParts["prt_patch"] = index.RawPart{PartID: "prt_patch", Kind: opencode.PartKindPatch, Title: "Update README", RawJSON: patchRaw, SizeBytes: int64(len(patchRaw))}
 	repo.rawParts["prt_safe_file"] = index.RawPart{PartID: "prt_safe_file", Kind: opencode.PartKindFile, FilePath: "README.md", RawJSON: fileRaw, SizeBytes: int64(len(fileRaw))}
 
@@ -834,7 +844,31 @@ func TestPrettyDetailRendersGenericToolPatchAndFile(t *testing.T) {
 		t.Fatalf("generic tool detail missing expected fields:\n%s", view)
 	}
 
+	model = model.openRawPart("prt_structured_output")
+	view = model.View()
+	if !strings.Contains(view, "File Tool Detail") || !strings.Contains(view, "first line") || !strings.Contains(view, "second line") || strings.Contains(view, `\"type\": \"text\"`) {
+		t.Fatalf("structured tool output was not rendered as readable text:\n%s", view)
+	}
+	model = sendKey(t, model, "R")
+	if !strings.Contains(model.View(), `"type": "text"`) {
+		t.Fatalf("raw toggle should still show stored structured output JSON:\n%s", model.View())
+	}
+
+	model = model.openRawPart("prt_long_read_output")
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 12})
+	model = sendKey(t, model, "G")
+	if !strings.Contains(plainView(model.View()), longOutputTail) {
+		t.Fatalf("long read output detail should scroll to tail:\n%s", model.View())
+	}
+	model = model.openRawPart("prt_long_line_read_output")
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 80, Height: 12})
+	model = sendKey(t, model, "G")
+	if !strings.Contains(plainView(model.View()), longLineOutputTail) {
+		t.Fatalf("long single-line read output detail should wrap and scroll to tail:\n%s", model.View())
+	}
+
 	model = model.openRawPart("prt_patch")
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 100, Height: 28})
 	view = model.View()
 	if !strings.Contains(view, "Patch Detail") || !strings.Contains(view, "README.md") || !strings.Contains(view, "Diff") || !strings.Contains(view, "+new") {
 		t.Fatalf("patch detail missing expected fields:\n%s", view)
