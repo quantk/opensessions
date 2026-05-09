@@ -1324,12 +1324,11 @@ func (m Model) partRows(part index.TimelinePart, partIndex, width int) []transcr
 		return bodyTextRows(m.cachedDisplayText(part), part.Role, width, partIndex, partIndex == m.selectedPart)
 	case opencode.PartKindTool, opencode.PartKindPatch, opencode.PartKindFile:
 		focused := partIndex == m.selectedPart
-		style := toolStyle
-		if focused {
-			style = activeToolStyle
-		}
 		line := compactPart(part)
-		return []transcriptLine{{text: renderRailLine(line, width, focused, false, style, focused), partIndex: partIndex}}
+		if focused {
+			return []transcriptLine{{text: renderRailLine(line, width, focused, false, activeToolStyle, true), partIndex: partIndex}}
+		}
+		return []transcriptLine{{text: renderRailStyledLine(compactPartStyled(part), width, false, false), partIndex: partIndex}}
 	case opencode.PartKindStepStart, opencode.PartKindStepFinish:
 		return nil
 	default:
@@ -1436,31 +1435,159 @@ func partTextFromRawJSON(raw string) string {
 	return data.Text
 }
 
+type compactPartField struct {
+	text   string
+	role   string
+	status string
+}
+
 func compactPart(part index.TimelinePart) string {
+	return strings.Join(compactPartFieldTexts(compactPartFields(part)), " - ")
+}
+
+func compactPartStyled(part index.TimelinePart) string {
+	fields := compactPartFields(part)
+	styled := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if strings.TrimSpace(field.text) == "" {
+			continue
+		}
+		style := toolStyle
+		if field.role == "status" {
+			style = timelineStatusStyle(field.status)
+		}
+		styled = append(styled, style.Render(field.text))
+	}
+	return strings.Join(styled, toolStyle.Render(" - "))
+}
+
+func compactPartFields(part index.TimelinePart) []compactPartField {
 	flags := partFlags(part)
 	switch part.Kind {
 	case opencode.PartKindTool:
 		if isLinkedTaskPart(part) {
-			label := "[subagent]"
+			label := "↪ subagent"
 			if part.SubagentName != "" {
-				label = "[subagent:" + part.SubagentName + "]"
+				label = "↪ subagent:" + part.SubagentName
 			}
-			fields := nonEmpty([]string{statusAffordance(part.Status), toolDisplayPreview(part), "opens " + part.LinkedSessionID})
-			return strings.Join(append([]string{label + " " + firstNonEmpty(part.Title, part.LinkedSessionID)}, append(fields, flags...)...), " - ")
+			fields := []compactPartField{{text: label + " " + firstNonEmpty(part.Title, part.LinkedSessionID)}}
+			fields = append(fields, statusPartField(part.Status))
+			fields = appendTextPartFields(fields, toolDisplayPreview(part), "opens "+part.LinkedSessionID)
+			return appendTextPartFields(fields, flags...)
 		}
-		fields := nonEmpty([]string{statusAffordance(part.Status), part.Title, shortPath(part.FilePath), toolDisplayPreview(part)})
-		return strings.Join(append([]string{"[tool] " + firstNonEmpty(part.ToolName, "tool")}, append(fields, flags...)...), " - ")
+		fields := []compactPartField{{text: toolLikeLabel(part.ToolName)}}
+		fields = append(fields, statusPartField(part.Status))
+		fields = appendTextPartFields(fields, toolDisplayTitle(part), shortPath(part.FilePath), toolDisplayPreview(part))
+		return appendTextPartFields(fields, flags...)
 	case opencode.PartKindPatch:
-		fields := nonEmpty([]string{part.Title, shortPath(part.FilePath), part.Preview})
-		return strings.Join(append([]string{"[patch]"}, append(fields, flags...)...), " - ")
+		fields := []compactPartField{{text: "✎ patch"}}
+		fields = appendTextPartFields(fields, part.Title, shortPath(part.FilePath), part.Preview)
+		return appendTextPartFields(fields, flags...)
 	case opencode.PartKindFile:
-		fields := nonEmpty([]string{shortPath(part.FilePath), part.Preview})
-		return strings.Join(append([]string{"[file]"}, append(fields, flags...)...), " - ")
+		fields := []compactPartField{{text: "◧ file"}}
+		fields = appendTextPartFields(fields, shortPath(part.FilePath), part.Preview)
+		return appendTextPartFields(fields, flags...)
 	case opencode.PartKindStepStart, opencode.PartKindStepFinish:
-		return strings.Join(nonEmpty([]string{"[" + string(part.Kind) + "]", part.Preview}), " ")
+		return compactTextFields("["+string(part.Kind)+"]", part.Preview)
 	default:
-		return strings.Join(nonEmpty([]string{"[" + firstNonEmpty(string(part.Kind), "part") + "]", part.Preview}), " ")
+		return compactTextFields("["+firstNonEmpty(string(part.Kind), "part")+"]", part.Preview)
 	}
+}
+
+func toolLikeLabel(toolName string) string {
+	name := firstNonEmpty(strings.TrimSpace(toolName), "tool")
+	return toolGlyph(name) + " " + name
+}
+
+func toolDisplayTitle(part index.TimelinePart) string {
+	title := strings.TrimSpace(part.Title)
+	if title == "" {
+		return ""
+	}
+	toolName := strings.TrimSpace(part.ToolName)
+	if strings.EqualFold(title, toolName) || strings.EqualFold(title, toolLikeLabel(toolName)) {
+		return ""
+	}
+	return title
+}
+
+func toolGlyph(toolName string) string {
+	switch strings.ToLower(strings.TrimSpace(toolName)) {
+	case "bash", "shell", "sh", "zsh", "terminal":
+		return "$"
+	case "grep", "rg", "ripgrep", "search", "glob", "find", "list", "ls":
+		return "⌕"
+	case "read", "view", "open", "file":
+		return "◧"
+	case "edit", "write", "apply_patch", "patch", "update", "create":
+		return "✎"
+	case "task", "subagent":
+		return "↪"
+	default:
+		return "◆"
+	}
+}
+
+func statusPartField(status string) compactPartField {
+	return compactPartField{text: timelineStatusSymbol(status), role: "status", status: status}
+}
+
+func timelineStatusSymbol(status string) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return ""
+	}
+	lower := strings.ToLower(status)
+	switch {
+	case strings.Contains(lower, "complete"), strings.Contains(lower, "success"), lower == "ok":
+		return "✓"
+	case strings.Contains(lower, "fail"), strings.Contains(lower, "error"), strings.Contains(lower, "cancel"):
+		return "✗"
+	case strings.Contains(lower, "run"), strings.Contains(lower, "pend"), strings.Contains(lower, "start"), strings.Contains(lower, "active"):
+		return "…"
+	default:
+		return "?"
+	}
+}
+
+func timelineStatusStyle(status string) lipgloss.Style {
+	status = strings.TrimSpace(status)
+	lower := strings.ToLower(status)
+	switch {
+	case strings.Contains(lower, "complete"), strings.Contains(lower, "success"), lower == "ok":
+		return successStyle
+	case strings.Contains(lower, "fail"), strings.Contains(lower, "error"), strings.Contains(lower, "cancel"):
+		return errorStyle
+	case strings.Contains(lower, "run"), strings.Contains(lower, "pend"), strings.Contains(lower, "start"), strings.Contains(lower, "active"):
+		return warnStyle
+	default:
+		return dimStyle
+	}
+}
+
+func compactTextFields(values ...string) []compactPartField {
+	return appendTextPartFields(nil, values...)
+}
+
+func appendTextPartFields(fields []compactPartField, values ...string) []compactPartField {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		fields = append(fields, compactPartField{text: value})
+	}
+	return fields
+}
+
+func compactPartFieldTexts(fields []compactPartField) []string {
+	texts := make([]string, 0, len(fields))
+	for _, field := range fields {
+		if strings.TrimSpace(field.text) != "" {
+			texts = append(texts, field.text)
+		}
+	}
+	return texts
 }
 
 func isLowSignalToolLifecyclePart(part index.TimelinePart) bool {
@@ -1479,6 +1606,9 @@ func isLowSignalToolLifecyclePart(part index.TimelinePart) bool {
 }
 
 func toolDisplayPreview(part index.TimelinePart) string {
+	if summary := toolInputPreview(part); summary != "" {
+		return summary
+	}
 	preview := strings.TrimSpace(part.Preview)
 	if preview == "" {
 		return ""
@@ -1486,15 +1616,106 @@ func toolDisplayPreview(part index.TimelinePart) string {
 	candidates := [][]string{
 		{part.ToolName, part.Status},
 		{part.ToolName, statusAffordance(part.Status)},
+		{part.ToolName, timelineStatusSymbol(part.Status)},
+		{toolLikeLabel(part.ToolName), timelineStatusSymbol(part.Status)},
 		{part.ToolName, part.Status, part.Title},
 		{part.ToolName, statusAffordance(part.Status), part.Title},
+		{part.ToolName, timelineStatusSymbol(part.Status), part.Title},
+		{toolLikeLabel(part.ToolName), timelineStatusSymbol(part.Status), part.Title},
 	}
 	for _, candidate := range candidates {
 		if strings.EqualFold(preview, strings.Join(nonEmpty(candidate), " - ")) {
 			return ""
 		}
 	}
+	return stripToolPreviewPrefix(preview, part.ToolName)
+}
+
+func stripToolPreviewPrefix(preview, toolName string) string {
+	for _, prefix := range []string{toolLikeLabel(toolName), strings.TrimSpace(toolName)} {
+		if prefix == "" {
+			continue
+		}
+		for _, separator := range []string{" - ", ": "} {
+			if rest, ok := strings.CutPrefix(preview, prefix+separator); ok && strings.TrimSpace(rest) != "" {
+				return strings.TrimSpace(rest)
+			}
+		}
+	}
 	return preview
+}
+
+func toolInputPreview(part index.TimelinePart) string {
+	data := rawPartMap(part.RawJSON)
+	if len(data) == 0 {
+		return ""
+	}
+	input := firstMap(mapValue(mapValue(data, "state"), "input"), mapValue(data, "input"), mapValue(data, "arguments"))
+	if len(input) == 0 {
+		return ""
+	}
+	tool := strings.ToLower(firstNonEmpty(part.ToolName, stringValue(data, "tool"), stringValue(data, "name")))
+	switch tool {
+	case "bash", "shell", "sh", "zsh", "terminal":
+		return singleLinePreview(stringValue(input, "command"))
+	case "read", "view", "open", "file":
+		return toolInputPath(input)
+	case "edit", "write", "apply_patch", "patch", "update", "create":
+		return firstNonEmpty(toolInputPath(input), editInputSummary(input))
+	case "grep", "rg", "ripgrep", "search", "glob", "find", "list", "ls":
+		return searchInputSummary(input)
+	default:
+		return firstNonEmpty(singleLinePreview(stringValue(input, "command")), toolInputPath(input), searchInputSummary(input), singleLinePreview(stringValue(input, "description")))
+	}
+}
+
+func rawPartMap(raw string) map[string]any {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var data map[string]any
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&data); err != nil {
+		return nil
+	}
+	return data
+}
+
+func toolInputPath(input map[string]any) string {
+	path := firstNonEmpty(
+		stringValue(input, "path"),
+		stringValue(input, "file"),
+		stringValue(input, "filePath"),
+		stringValue(input, "filepath"),
+		stringValue(input, "filename"),
+	)
+	return singleLinePreview(path)
+}
+
+func searchInputSummary(input map[string]any) string {
+	query := firstNonEmpty(stringValue(input, "pattern"), stringValue(input, "query"), stringValue(input, "glob"))
+	path := toolInputPath(input)
+	switch {
+	case query != "" && path != "":
+		return singleLinePreview(query + " in " + path)
+	case query != "":
+		return singleLinePreview(query)
+	default:
+		return path
+	}
+}
+
+func editInputSummary(input map[string]any) string {
+	for _, key := range []string{"edits", "changes"} {
+		if edits, ok := valueAt(input, key).([]any); ok && len(edits) > 0 {
+			if len(edits) == 1 {
+				return "1 edit"
+			}
+			return fmt.Sprintf("%d edits", len(edits))
+		}
+	}
+	return ""
 }
 
 func statusAffordance(status string) string {

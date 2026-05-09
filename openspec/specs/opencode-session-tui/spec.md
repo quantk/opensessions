@@ -1,9 +1,7 @@
 ## Purpose
 
 Define the terminal user interface requirements for safely discovering, indexing, browsing, searching, and inspecting local agent session history.
-
 ## Requirements
-
 ### Requirement: OpenCode storage discovery
 The system SHALL discover and read local OpenCode storage from the default OpenCode data directory and SHALL allow the storage root to be overridden by configuration or command-line input.
 
@@ -59,12 +57,23 @@ The system SHALL allow the user to browse top-level sessions from enabled source
 - **AND** the system does not display that child session as a selectable top-level row in project-grouped session-list mode
 
 ### Requirement: Session preview and timeline
-The system SHALL provide a source-aware session preview and a detailed timeline view containing user messages, assistant messages, tool events, file references or tool targets, summaries, and bounded text previews for sessions from enabled sources.
+The system SHALL provide a source-aware session preview and a detailed timeline view containing user messages, assistant messages, compact glyph-led tool events, file references or tool targets, summaries, and bounded text previews for sessions from enabled sources. Timeline rows for tool, patch, file, and linked subagent/task parts SHALL avoid bracketed type labels such as `[tool]` and SHALL render status in the timeline with compact status symbols rather than status words.
 
 #### Scenario: User opens a session
 - **WHEN** the user selects a session from any enabled source and opens it
 - **THEN** the system displays the appropriate chronological or branch-projected timeline for that session without loading unrelated sessions
 - **AND** the timeline header identifies the session source when source identity is relevant to the view
+
+#### Scenario: Tool-like rows use compact visual labels
+- **WHEN** the user views a session timeline containing tool, patch, file, or linked subagent/task parts
+- **THEN** those rows use compact glyph-led labels instead of bracketed textual labels
+- **AND** tool status is shown with a compact symbol such as `✓`, `✗`, `…`, or `?` without displaying status words such as `completed` in the timeline row
+- **AND** high-signal metadata such as tool name, title, file path or target, preview text, linked child-session information, and heavy flags remains visible when available
+
+#### Scenario: Tool-like row actions are preserved
+- **WHEN** the user focuses a compact tool-like timeline row
+- **AND** the user opens it with `Enter` or `l`
+- **THEN** the system keeps the existing detail-view or linked child-session navigation behavior for that row type
 
 ### Requirement: Bounded text message detail viewing
 The system SHALL allow users to open safe text message parts from the session timeline into a scrollable detail view that displays more content than the bounded timeline preview while still applying a larger safety limit before wrapping or markdown rendering.
@@ -252,28 +261,140 @@ The system SHALL store its source-aware search index, scan metadata, tags, and b
 - **THEN** the tag is saved in the application database and no source storage file is modified
 - **AND** the tag remains associated with the selected source session rather than another session with the same external identifier
 
+### Requirement: Immediate startup with cached data
+The system SHALL start the TUI without waiting for source scanning or indexing when an application-owned index database can be opened, and SHALL use currently cached sessions as the initial session list.
+
+#### Scenario: Cached sessions are shown immediately
+- **WHEN** the user starts the TUI with scanning enabled
+- **AND** the application database already contains indexed sessions
+- **THEN** the system opens the TUI using the cached session list before the startup source scan completes
+- **AND** the system indicates that a background index refresh is in progress
+
+#### Scenario: Empty cache still opens the TUI
+- **WHEN** the user starts the TUI with scanning enabled
+- **AND** the application database contains no indexed sessions for the enabled sources
+- **THEN** the system opens the TUI without waiting for the source scan to complete
+- **AND** the system displays an empty or loading state that explains indexing is in progress
+
+#### Scenario: Scan is disabled
+- **WHEN** the user starts the TUI with `--no-scan`
+- **THEN** the system opens the TUI using only the cached application database contents
+- **AND** the system does not start a background source scan
+
+### Requirement: Background indexing status and refresh
+The system SHALL run enabled source scanning and index refresh work in the background after TUI startup, SHALL display truthful indexing status in the TUI, and SHALL refresh cached session browsing data after indexing completes.
+
+#### Scenario: Background indexing reports progress
+- **WHEN** a startup background index refresh is running
+- **THEN** the TUI displays the current indexing state using available source, phase, or count information
+- **AND** normal keyboard navigation of already loaded views remains responsive
+
+#### Scenario: Background indexing completes
+- **WHEN** a startup background index refresh completes successfully
+- **THEN** the TUI updates its indexing status to completed or up to date
+- **AND** the session list cache is refreshed from the application database
+- **AND** the system preserves the currently selected session when that session is still present in the refreshed visible list
+
+#### Scenario: Background indexing fails
+- **WHEN** a startup background index refresh fails
+- **THEN** the TUI displays a non-fatal indexing error status
+- **AND** cached sessions that were already loaded remain available for browsing
+- **AND** the system does not modify OpenCode or Pi source storage as part of error recovery
+
 ### Requirement: Incremental startup indexing
-The system SHALL use application-owned scan metadata to avoid reparsing and rewriting unchanged OpenCode records during normal startup scans, and MUST keep OpenCode storage read-only while doing so.
+The system SHALL use application-owned scan metadata to avoid reparsing and rewriting unchanged OpenCode records during normal startup index refreshes, SHALL use row-level freshness for OpenCode SQLite database-backed records when available, and MUST keep OpenCode storage read-only while doing so.
 
 #### Scenario: First scan indexes storage
 - **WHEN** the application starts with no existing scan metadata for the configured OpenCode storage
 - **THEN** the system scans available OpenCode records and persists session, message, part, search, and scan metadata in the application database
 - **AND** the system leaves all OpenCode storage files unchanged
 
-#### Scenario: Unchanged storage is skipped
-- **WHEN** the application starts after a completed scan
-- **AND** an OpenCode source record has the same source path, size, and modification time as the stored scan metadata
+#### Scenario: Unchanged filesystem storage is skipped
+- **WHEN** the application performs a startup index refresh after a completed scan
+- **AND** an OpenCode filesystem source record has the same source path, size, and modification time as the stored scan metadata
 - **THEN** the system reuses the existing application-indexed record without reparsing the source payload
 - **AND** the system does not rewrite unchanged index rows for that source record
 
-#### Scenario: Changed storage is refreshed
-- **WHEN** an OpenCode source record has changed size or modification time since the stored scan metadata
+#### Scenario: Changed filesystem storage is refreshed
+- **WHEN** an OpenCode filesystem source record has changed size or modification time since the stored scan metadata
 - **THEN** the system reparses that source record and refreshes its dependent session summary, timeline, search, and scan metadata in the application database
+
+#### Scenario: Unchanged OpenCode database rows are skipped after database mtime changes
+- **WHEN** the `opencode.db` file modification time changes
+- **AND** an OpenCode database-backed source row has the same synthetic source path and row-level freshness metadata as the stored scan metadata
+- **THEN** the system reuses the existing application-indexed record without reparsing that database row payload
+- **AND** the system does not rewrite unchanged index rows for that database-backed source record
+
+#### Scenario: Changed OpenCode database rows are refreshed
+- **WHEN** an OpenCode database-backed source row has changed row-level freshness metadata since the stored scan metadata
+- **THEN** the system reparses that database row and refreshes its dependent session summary, timeline, search, and scan metadata in the application database
 
 #### Scenario: Duplicate storage sources are not double processed
 - **WHEN** the same OpenCode record is available from both JSON storage and `opencode.db`
 - **THEN** the system selects one current source for indexing that record before doing expensive payload classification
 - **AND** the system does not parse duplicate heavy payloads solely to discard them during deduplication
+
+### Requirement: Nord-inspired TUI visual theme
+The system SHALL render the terminal user interface with a cohesive Nord-inspired semantic visual theme across session browsing, timeline browsing, session tree browsing, search prompts, footers, warnings, and part or message detail views.
+
+#### Scenario: User views themed session list
+- **WHEN** the user opens the session list
+- **THEN** the system displays title, mode, metadata, source badges, selected rows, dim text, and footer help using a consistent semantic color scheme
+- **AND** the session list remains readable after ANSI styling is stripped
+
+#### Scenario: User views themed timeline
+- **WHEN** the user opens a session timeline
+- **THEN** the system displays role labels, source metadata, reasoning state, token metadata when available, tool rows, and footer help using the same semantic visual theme
+- **AND** status or role meaning is not conveyed by color alone
+
+#### Scenario: Terminal width is narrow
+- **WHEN** the TUI renders in a narrow terminal
+- **THEN** themed headers, rows, prompts, and footers continue to truncate or wrap within the available width without overflowing
+
+### Requirement: Left focus rail
+The system SHALL indicate the currently focused selectable row or content block with a left-side focus rail rather than a plain `>` text marker.
+
+#### Scenario: Session row is focused
+- **WHEN** the user moves focus to a session row in the session list
+- **THEN** the focused session row displays a visible left focus rail
+- **AND** the row does not use `>` as the focus indicator
+
+#### Scenario: Timeline text block is focused
+- **WHEN** the user moves focus to a text, reasoning, tool, patch, file, or linked task item in the timeline
+- **THEN** the focused item displays a visible left focus rail
+- **AND** multi-line focused content preserves alignment between the first focused line and continuation lines
+
+#### Scenario: Session tree row is focused
+- **WHEN** the user opens a source-specific session tree and moves focus between tree entries
+- **THEN** the focused tree entry displays the same focus rail affordance used elsewhere in the TUI
+- **AND** tree indentation and branch glyphs remain readable
+
+#### Scenario: Focus rail consumes layout width
+- **WHEN** focused content is wrapped or truncated
+- **THEN** the system accounts for the focus rail width before wrapping or truncating the row content
+- **AND** the rendered row remains within the terminal width
+
+### Requirement: Visual status and source affordances
+The system SHALL render source identity, role identity, bookmarks, and tool or part statuses with consistent textual labels and visual affordances that improve scanability without replacing existing information.
+
+#### Scenario: Source badge is shown
+- **WHEN** the system displays a selectable session row or session preview
+- **THEN** the row or preview includes a source badge identifying the source kind
+- **AND** the badge remains understandable as text when ANSI styling is stripped
+
+#### Scenario: Tool status is shown
+- **WHEN** the system displays a tool row or tool detail with known status metadata
+- **THEN** the status is visually distinguished with a consistent affordance such as an icon, label, or themed style
+- **AND** the status remains understandable from text alone
+
+#### Scenario: Bookmark is shown
+- **WHEN** a bookmarked session is displayed in the session list or preview
+- **THEN** the bookmark indicator remains visually distinct from source identity, focus, and tool status indicators
+
+#### Scenario: Warning or unsafe content guard is shown
+- **WHEN** the system displays a warning, raw guard, or unsafe-content guard message
+- **THEN** the warning uses the themed warning affordance
+- **AND** the guard text remains explicit about what content is unavailable or unsafe
 
 ### Requirement: Context-sensitive search
 The system SHALL make `/` enter search mode for the currently active view and SHALL derive search scope from that view.

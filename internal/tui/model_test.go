@@ -670,8 +670,8 @@ func TestTimelineOpensFocusedToolDetails(t *testing.T) {
 		t.Fatalf("selected part = %d, want tool focus after j", model.selectedPart)
 	}
 	plain := plainView(model.View())
-	if !strings.Contains(plain, "▌ [tool] bash") || strings.Contains(plain, "> [tool] bash") || !strings.Contains(plain, "✓ completed") {
-		t.Fatalf("focused tool card missing rail/status affordance:\n%s", model.View())
+	if !strings.Contains(plain, "▌ $ bash") || strings.Contains(plain, "> $ bash") || !strings.Contains(plain, "✓") || strings.Contains(plain, "✓ completed") {
+		t.Fatalf("focused tool row missing compact rail/status affordance:\n%s", model.View())
 	}
 
 	model = sendKey(t, model, "enter")
@@ -701,8 +701,8 @@ func TestLinkedTaskOpensChildTimelineAndBackRestoresParent(t *testing.T) {
 	model := NewModel(repo, repo.sessions)
 	model = sendKey(t, model, "l")
 	model = sendKey(t, model, "j")
-	if plain := plainView(model.View()); !strings.Contains(plain, "▌ [subagent:explore] Research dependency") || strings.Contains(plain, "> [subagent:explore]") {
-		t.Fatalf("linked task row missing rail/subagent affordance:\n%s", model.View())
+	if plain := plainView(model.View()); !strings.Contains(plain, "▌ ↪ subagent:explore Research dependency") || strings.Contains(plain, "> ↪ subagent:explore") {
+		t.Fatalf("linked task row missing compact rail/subagent affordance:\n%s", model.View())
 	}
 	model = sendKey(t, model, "enter")
 	view := plainView(model.View())
@@ -893,11 +893,122 @@ func TestTimelineHidesLowSignalReadLifecycleParts(t *testing.T) {
 	model := NewModel(repo, repo.sessions)
 	model = sendKey(t, model, "l")
 	plain := plainView(model.View())
-	if strings.Contains(plain, "read - started") || strings.Contains(plain, "read - completed") || strings.Contains(plain, "[tool] read") {
+	if strings.Contains(plain, "read - started") || strings.Contains(plain, "read - completed") || strings.Contains(plain, "[tool] read") || strings.Contains(plain, "◧ read") {
 		t.Fatalf("low-signal read lifecycle parts should not render:\n%s", model.View())
 	}
-	if !strings.Contains(plain, "[tool] bash") || !strings.Contains(plain, "go test ./...") {
+	if !strings.Contains(plain, "$ bash") || !strings.Contains(plain, "go test ./...") {
 		t.Fatalf("useful tool row should still render:\n%s", model.View())
+	}
+}
+
+func TestTimelineToolRowsUseCompactGlyphsAndStatusSymbols(t *testing.T) {
+	repo := newFakeRepo(t)
+	repo.timelines["ses_project"] = []index.TimelinePart{
+		{PartID: "prt_text", SessionID: "ses_project", MessageID: "msg_user", Role: "user", Kind: opencode.PartKindText, Preview: "run tools", IndexText: "run tools"},
+		{PartID: "prt_bash", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "bash", Status: "completed", Preview: "go test ./..."},
+		{PartID: "prt_grep", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "grep", Status: "failed", Preview: "needle"},
+		{PartID: "prt_edit", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "edit", Status: "started", FilePath: "internal/tui/model.go"},
+		{PartID: "prt_custom", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindTool, ToolName: "custom_lookup", Status: "mystery", Preview: "query users", Heavy: true, SkippedRaw: true},
+		{PartID: "prt_patch", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindPatch, Title: "Update README", FilePath: "README.md"},
+		{PartID: "prt_file", SessionID: "ses_project", MessageID: "msg_assistant", Role: "assistant", Kind: opencode.PartKindFile, FilePath: "README.md", Preview: "docs"},
+	}
+
+	model := NewModel(repo, repo.sessions)
+	model, _ = updateModel(t, model, tea.WindowSizeMsg{Width: 100, Height: 24})
+	model = sendKey(t, model, "l")
+	plain := plainView(model.View())
+
+	for _, want := range []string{
+		"$ bash - ✓ - go test ./...",
+		"⌕ grep - ✗ - needle",
+		"✎ edit - … - internal/tui/model.go",
+		"◆ custom_lookup - ? - query users - heavy",
+		"✎ patch - Update README - README.md",
+		"◧ file - README.md - docs",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("compact timeline row %q missing:\n%s", want, model.View())
+		}
+	}
+	for _, forbidden := range []string{"[tool]", "[patch]", "[file]", "✓ completed", "✗ failed", "… started", "? mystery"} {
+		if strings.Contains(plain, forbidden) {
+			t.Fatalf("timeline row contains forbidden compact formatting text %q:\n%s", forbidden, model.View())
+		}
+	}
+}
+
+func TestCompactToolRowUsesRawInputSummary(t *testing.T) {
+	tests := []struct {
+		name string
+		part index.TimelinePart
+		want string
+	}{
+		{
+			name: "pi bash command",
+			part: index.TimelinePart{Kind: opencode.PartKindTool, ToolName: "bash", Status: "failed", Title: "bash", Preview: `bash - {"command":"go test ./internal/tui","timeout":120}`, RawJSON: `{"type":"toolCall","name":"bash","arguments":{"command":"go test ./internal/tui","timeout":120}}`},
+			want: `$ bash - ✗ - go test ./internal/tui`,
+		},
+		{
+			name: "pi read path",
+			part: index.TimelinePart{Kind: opencode.PartKindTool, ToolName: "read", Status: "completed", Title: "read", Preview: `read - {"limit":70,"offset":1380,"path":"internal/tui/model_test.go"}`, RawJSON: `{"type":"toolCall","name":"read","arguments":{"limit":70,"offset":1380,"path":"internal/tui/model_test.go"}}`},
+			want: `◧ read - ✓ - internal/tui/model_test.go`,
+		},
+		{
+			name: "pi edit path",
+			part: index.TimelinePart{Kind: opencode.PartKindTool, ToolName: "edit", Status: "completed", Title: "edit", Preview: `edit - {"path":"internal/tui/model.go"}`, RawJSON: `{"type":"toolCall","name":"edit","arguments":{"path":"internal/tui/model.go","edits":[{"oldText":"x","newText":"y"}]}}`},
+			want: `✎ edit - ✓ - internal/tui/model.go`,
+		},
+		{
+			name: "pi edit count fallback",
+			part: index.TimelinePart{Kind: opencode.PartKindTool, ToolName: "edit", Status: "completed", Title: "edit", Preview: `edit - {"edits":[{"oldText":"x"}]}`, RawJSON: `{"type":"toolCall","name":"edit","arguments":{"edits":[{"oldText":"x","newText":"y"}]}}`},
+			want: `✎ edit - ✓ - 1 edit`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := compactPart(tt.part)
+			if got != tt.want {
+				t.Fatalf("compactPart() = %q, want %q", got, tt.want)
+			}
+			if strings.Contains(got, "{\"") {
+				t.Fatalf("compact row should prefer readable input summary over JSON: %q", got)
+			}
+		})
+	}
+}
+
+func TestCompactToolRowStripsRedundantToolName(t *testing.T) {
+	tests := []struct {
+		name string
+		part index.TimelinePart
+		want string
+	}{
+		{
+			name: "preview prefix",
+			part: index.TimelinePart{Kind: opencode.PartKindTool, ToolName: "bash", Status: "completed", Preview: `bash - {"command":"go test ./internal/tui"}`},
+			want: `$ bash - ✓ - {"command":"go test ./internal/tui"}`,
+		},
+		{
+			name: "title equals tool",
+			part: index.TimelinePart{Kind: opencode.PartKindTool, ToolName: "edit", Status: "completed", Title: "edit", Preview: `{"edits":[{"oldText":"x"}]}`},
+			want: `✎ edit - ✓ - {"edits":[{"oldText":"x"}]}`,
+		},
+		{
+			name: "descriptive title preserved",
+			part: index.TimelinePart{Kind: opencode.PartKindTool, ToolName: "bash", Status: "completed", Title: "Run tests", Preview: `go test ./...`},
+			want: `$ bash - ✓ - Run tests - go test ./...`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := compactPart(tt.part)
+			if got != tt.want {
+				t.Fatalf("compactPart() = %q, want %q", got, tt.want)
+			}
+			if strings.Contains(got, "$ bash - ✓ - bash -") || strings.Contains(got, "✎ edit - ✓ - edit -") {
+				t.Fatalf("compact row duplicated tool name: %q", got)
+			}
+		})
 	}
 }
 
